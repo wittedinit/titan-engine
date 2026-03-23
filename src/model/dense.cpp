@@ -1,117 +1,235 @@
 #include "model/dense.h"
+#include "model/loader.h"
 #include "compute/dispatch.h"
 #include "core/logging.h"
 
 #include <cuda_runtime.h>
-#include <fstream>
 #include <cstring>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
+
+// Forward declarations for gemv.cu
+namespace titan { namespace cuda {
+    void gemv_fp32(const float* A, const float* x, float* y,
+                   int rows, int cols, cudaStream_t stream);
+    void vector_add(float* y, const float* a, const float* b, int n, cudaStream_t stream);
+    void init_cublas();
+    void destroy_cublas();
+}}
 
 namespace titan {
 
 DenseExecutor::~DenseExecutor() {
     free_scratch_buffers();
-    // Weight memory is managed by MemoryManager, not freed here
+    cuda::destroy_cublas();
 }
 
 void DenseExecutor::allocate_scratch_buffers() {
     uint32_t qkv_dim = config_.num_attn_heads * config_.head_dim;
     uint32_t kv_dim = config_.num_kv_heads * config_.head_dim;
+    uint32_t inter = config_.intermediate_dim;
+    uint32_t hd = config_.hidden_dim;
 
     cudaMalloc(&q_buf_, qkv_dim * sizeof(float));
     cudaMalloc(&k_buf_, kv_dim * sizeof(float));
     cudaMalloc(&v_buf_, kv_dim * sizeof(float));
     cudaMalloc(&attn_out_, qkv_dim * sizeof(float));
-    cudaMalloc(&gate_buf_, config_.intermediate_dim * sizeof(float));
-    cudaMalloc(&up_buf_, config_.intermediate_dim * sizeof(float));
-    cudaMalloc(&down_buf_, config_.hidden_dim * sizeof(float));
-    cudaMalloc(&norm_buf_, config_.hidden_dim * sizeof(float));
-
-    LOG_INFO("Scratch buffers allocated: %.1f MB",
-             (qkv_dim * 2 + kv_dim * 2 + config_.intermediate_dim * 2 +
-              config_.hidden_dim * 2) * sizeof(float) / 1e6);
+    cudaMalloc(&gate_buf_, inter * sizeof(float));
+    cudaMalloc(&up_buf_, inter * sizeof(float));
+    cudaMalloc(&down_buf_, hd * sizeof(float));
+    cudaMalloc(&norm_buf_, hd * sizeof(float));
 }
 
 void DenseExecutor::free_scratch_buffers() {
-    auto safe_free = [](float*& p) { if (p) { cudaFree(p); p = nullptr; } };
-    safe_free(q_buf_); safe_free(k_buf_); safe_free(v_buf_);
-    safe_free(attn_out_); safe_free(gate_buf_); safe_free(up_buf_);
-    safe_free(down_buf_); safe_free(norm_buf_);
+    auto sf = [](float*& p) { if (p) { cudaFree(p); p = nullptr; } };
+    sf(q_buf_); sf(k_buf_); sf(v_buf_); sf(attn_out_);
+    sf(gate_buf_); sf(up_buf_); sf(down_buf_); sf(norm_buf_);
 }
 
 // ============================================================================
-// Weight Loading
+// Load weights from safetensors using the ModelLoader
 // ============================================================================
 
-bool DenseExecutor::load_weights(const std::string& model_path) {
-    // For FP32/FP16 models: mmap the safetensors files and copy to GPU
-    // For quantized models: the weights are already in the right format
-    //
-    // We use a simplified approach:
-    // 1. Parse safetensors header to get tensor locations
-    // 2. mmap the data region
-    // 3. For each tensor, allocate in the appropriate tier and copy
-
-    layer_weights_.resize(config_.num_layers);
-
-    // For now, allocate placeholder weights on GPU (zeros)
-    // The full loader integration will populate these from safetensors
-    size_t hidden = config_.hidden_dim;
-    size_t heads = config_.num_attn_heads;
-    size_t kv_heads = config_.num_kv_heads;
-    size_t head_dim = config_.head_dim;
-    size_t inter = config_.intermediate_dim;
-    size_t vocab = config_.vocab_size;
-
-    size_t qkv_dim = heads * head_dim;
-    size_t kv_proj_dim = kv_heads * head_dim;
-
-    // Embedding: [vocab_size, hidden_dim] in FP32
-    cudaMalloc(&embedding_, vocab * hidden * sizeof(float));
-    cudaMemset(embedding_, 0, vocab * hidden * sizeof(float));
-
-    // Final norm
-    cudaMalloc(&final_norm_, hidden * sizeof(float));
-    // Initialize to ones (identity normalization)
-    std::vector<float> ones(hidden, 1.0f);
-    cudaMemcpy(final_norm_, ones.data(), hidden * sizeof(float), cudaMemcpyHostToDevice);
-
-    // LM head (reuse embedding for tied weights, or allocate separately)
-    lm_head_ = embedding_; // Weight tying
-
-    // Per-layer weights
-    for (uint32_t l = 0; l < config_.num_layers; l++) {
-        auto& lw = layer_weights_[l];
-
-        // Norms (FP32, small)
-        cudaMalloc(&lw.attn_norm, hidden * sizeof(float));
-        cudaMalloc(&lw.ffn_norm, hidden * sizeof(float));
-        cudaMemcpy(lw.attn_norm, ones.data(), hidden * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(lw.ffn_norm, ones.data(), hidden * sizeof(float), cudaMemcpyHostToDevice);
-
-        // Attention projections (FP32 for now — quantized path uses different layout)
-        cudaMalloc(&lw.q_proj, qkv_dim * hidden * sizeof(float));
-        cudaMalloc(&lw.k_proj, kv_proj_dim * hidden * sizeof(float));
-        cudaMalloc(&lw.v_proj, kv_proj_dim * hidden * sizeof(float));
-        cudaMalloc(&lw.o_proj, hidden * qkv_dim * sizeof(float));
-        cudaMemset(lw.q_proj, 0, qkv_dim * hidden * sizeof(float));
-        cudaMemset(lw.k_proj, 0, kv_proj_dim * hidden * sizeof(float));
-        cudaMemset(lw.v_proj, 0, kv_proj_dim * hidden * sizeof(float));
-        cudaMemset(lw.o_proj, 0, hidden * qkv_dim * sizeof(float));
-
-        // FFN projections
-        cudaMalloc(&lw.gate_proj, inter * hidden * sizeof(float));
-        cudaMalloc(&lw.up_proj, inter * hidden * sizeof(float));
-        cudaMalloc(&lw.down_proj, hidden * inter * sizeof(float));
-        cudaMemset(lw.gate_proj, 0, inter * hidden * sizeof(float));
-        cudaMemset(lw.up_proj, 0, inter * hidden * sizeof(float));
-        cudaMemset(lw.down_proj, 0, hidden * inter * sizeof(float));
+// Helper: allocate GPU buffer and load tensor data into it
+static float* load_tensor_to_gpu(ModelLoader& loader, const std::string& name,
+                                  size_t expected_elements = 0) {
+    if (!loader.has_tensor(name)) {
+        LOG_WARN("Tensor not found: %s (will use zeros)", name.c_str());
+        if (expected_elements > 0) {
+            float* buf = nullptr;
+            cudaMalloc(&buf, expected_elements * sizeof(float));
+            cudaMemset(buf, 0, expected_elements * sizeof(float));
+            return buf;
+        }
+        return nullptr;
     }
 
-    LOG_INFO("Weight placeholders allocated for %u layers", config_.num_layers);
+    auto meta = loader.get_meta(name);
+    size_t bytes = meta.byte_size();
+
+    // For FP16/BF16 weights, we need to convert to FP32 for now
+    // In the quantized path, weights stay in their native format
+    bool needs_fp32_convert = (meta.dtype == DType::FP16 || meta.dtype == DType::BF16);
+
+    float* gpu_buf = nullptr;
+
+    if (needs_fp32_convert) {
+        // Load as raw bytes, then convert FP16→FP32 on CPU
+        // (In production, do this conversion on GPU)
+        size_t num_elem = meta.numel();
+        std::vector<uint16_t> fp16_data(num_elem);
+        ssize_t read = loader.read_tensor_cpu(name, fp16_data.data(), bytes);
+        if (read != (ssize_t)bytes) {
+            LOG_ERROR("Failed to read %s", name.c_str());
+            return nullptr;
+        }
+
+        // FP16 → FP32 conversion on CPU
+        std::vector<float> fp32_data(num_elem);
+        for (size_t i = 0; i < num_elem; i++) {
+            // IEEE 754 half → float
+            uint16_t h = fp16_data[i];
+            uint32_t sign = (h >> 15) & 1;
+            uint32_t exp = (h >> 10) & 0x1F;
+            uint32_t mant = h & 0x3FF;
+
+            uint32_t f;
+            if (exp == 0) {
+                if (mant == 0) {
+                    f = sign << 31;
+                } else {
+                    // Denormalized
+                    exp = 1;
+                    while (!(mant & 0x400)) { mant <<= 1; exp--; }
+                    mant &= 0x3FF;
+                    f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+                }
+            } else if (exp == 31) {
+                f = (sign << 31) | 0x7F800000 | (mant << 13);
+            } else {
+                f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+            }
+
+            memcpy(&fp32_data[i], &f, 4);
+        }
+
+        cudaMalloc(&gpu_buf, num_elem * sizeof(float));
+        cudaMemcpy(gpu_buf, fp32_data.data(), num_elem * sizeof(float),
+                    cudaMemcpyHostToDevice);
+
+        LOG_DEBUG("  Loaded %s: [%s] %s → fp32 (%zu elements)",
+                  name.c_str(), meta.dtype_str.c_str(),
+                  meta.shape.size() > 0 ? std::to_string(meta.shape[0]).c_str() : "?",
+                  num_elem);
+    } else {
+        // FP32: load directly
+        cudaMalloc(&gpu_buf, bytes);
+        loader.read_tensor_gpu(name, gpu_buf, bytes);
+    }
+
+    return gpu_buf;
+}
+
+// Load norm weights (always small, always FP32 or needs conversion)
+static float* load_norm_weights(ModelLoader& loader, const std::string& name,
+                                 uint32_t dim) {
+    float* buf = load_tensor_to_gpu(loader, name, dim);
+    if (!buf) {
+        // Initialize to ones (identity norm) if not found
+        cudaMalloc(&buf, dim * sizeof(float));
+        std::vector<float> ones(dim, 1.0f);
+        cudaMemcpy(buf, ones.data(), dim * sizeof(float), cudaMemcpyHostToDevice);
+    }
+    return buf;
+}
+
+bool DenseExecutor::load_weights(const std::string& model_path) {
+    ModelLoader loader;
+    if (!loader.load(model_path)) {
+        LOG_ERROR("Failed to load model metadata");
+        return false;
+    }
+
+    // Log available tensors for debugging
+    auto names = loader.tensor_names();
+    LOG_INFO("Model has %zu tensors", names.size());
+
+    // Detect naming convention
+    // Llama-style: "model.layers.{N}.self_attn.q_proj.weight"
+    // Some models: "model.layers.{N}.attention.wq.weight"
+    // Try to auto-detect
+    std::string layer_prefix = "model.layers.";
+    std::string attn_prefix = ".self_attn.";
+    std::string ffn_prefix = ".mlp.";
+
+    // Check if first layer exists with this naming
+    std::string test = layer_prefix + "0" + attn_prefix + "q_proj.weight";
+    if (!loader.has_tensor(test)) {
+        // Try alternative naming
+        test = layer_prefix + "0.attention.wq.weight";
+        if (loader.has_tensor(test)) {
+            attn_prefix = ".attention.";
+            // Use wq/wk/wv/wo naming
+        }
+    }
+
+    uint32_t hd = config_.hidden_dim;
+    uint32_t qkv_dim = config_.num_attn_heads * config_.head_dim;
+    uint32_t kv_dim = config_.num_kv_heads * config_.head_dim;
+    uint32_t inter = config_.intermediate_dim;
+    uint32_t vocab = config_.vocab_size;
+
+    // Embedding
+    LOG_INFO("Loading embedding...");
+    embedding_ = load_tensor_to_gpu(loader, "model.embed_tokens.weight", vocab * hd);
+    if (!embedding_) {
+        // Try alternative names
+        embedding_ = load_tensor_to_gpu(loader, "lm_head.weight", vocab * hd);
+    }
+
+    // Final norm
+    final_norm_ = load_norm_weights(loader, "model.norm.weight", hd);
+
+    // LM head (may be tied with embedding)
+    if (loader.has_tensor("lm_head.weight")) {
+        lm_head_ = load_tensor_to_gpu(loader, "lm_head.weight", vocab * hd);
+    } else {
+        lm_head_ = embedding_; // Weight tying
+        LOG_INFO("LM head tied with embedding");
+    }
+
+    // Per-layer weights
+    layer_weights_.resize(config_.num_layers);
+    for (uint32_t l = 0; l < config_.num_layers; l++) {
+        auto& lw = layer_weights_[l];
+        std::string lp = layer_prefix + std::to_string(l);
+
+        LOG_INFO("Loading layer %u/%u...", l + 1, config_.num_layers);
+
+        // Norms
+        lw.attn_norm = load_norm_weights(loader,
+            lp + ".input_layernorm.weight", hd);
+        lw.ffn_norm = load_norm_weights(loader,
+            lp + ".post_attention_layernorm.weight", hd);
+
+        // Attention projections
+        lw.q_proj = load_tensor_to_gpu(loader,
+            lp + attn_prefix + "q_proj.weight", qkv_dim * hd);
+        lw.k_proj = load_tensor_to_gpu(loader,
+            lp + attn_prefix + "k_proj.weight", kv_dim * hd);
+        lw.v_proj = load_tensor_to_gpu(loader,
+            lp + attn_prefix + "v_proj.weight", kv_dim * hd);
+        lw.o_proj = load_tensor_to_gpu(loader,
+            lp + attn_prefix + "o_proj.weight", hd * qkv_dim);
+
+        // FFN projections (SwiGLU: gate + up + down)
+        lw.gate_proj = load_tensor_to_gpu(loader,
+            lp + ffn_prefix + "gate_proj.weight", inter * hd);
+        lw.up_proj = load_tensor_to_gpu(loader,
+            lp + ffn_prefix + "up_proj.weight", inter * hd);
+        lw.down_proj = load_tensor_to_gpu(loader,
+            lp + ffn_prefix + "down_proj.weight", hd * inter);
+    }
+
+    LOG_INFO("All weights loaded to GPU");
     return true;
 }
 
@@ -125,17 +243,17 @@ bool DenseExecutor::initialize(const std::string& model_path,
     memory_ = &memory;
     runtime_ = runtime;
 
-    // Load model config
     config_ = load_model_config(model_path + "/config.json");
     if (config_.hidden_dim == 0) {
         LOG_ERROR("Failed to load model config");
         return false;
     }
 
-    // Infer head_dim if not set
-    if (config_.head_dim == 0 && config_.num_attn_heads > 0) {
+    if (config_.head_dim == 0 && config_.num_attn_heads > 0)
         config_.head_dim = config_.hidden_dim / config_.num_attn_heads;
-    }
+
+    // Initialize cuBLAS
+    cuda::init_cublas();
 
     // Initialize KV cache
     if (!kv_cache_.initialize(config_.num_layers, config_.num_kv_heads,
@@ -144,18 +262,17 @@ bool DenseExecutor::initialize(const std::string& model_path,
         return false;
     }
 
-    // Load weights
+    // Load weights from safetensors
     if (!load_weights(model_path)) {
         LOG_ERROR("Failed to load weights");
         return false;
     }
 
-    // Allocate scratch
     allocate_scratch_buffers();
 
-    LOG_INFO("Dense executor initialized: %s (%uL, h=%u, heads=%u/%u)",
+    LOG_INFO("Dense executor ready: %s (%uL, h=%u, heads=%u/%u, inter=%u)",
              config_.name.c_str(), config_.num_layers, config_.hidden_dim,
-             config_.num_attn_heads, config_.num_kv_heads);
+             config_.num_attn_heads, config_.num_kv_heads, config_.intermediate_dim);
 
     return true;
 }
@@ -165,11 +282,7 @@ bool DenseExecutor::initialize(const std::string& model_path,
 // ============================================================================
 
 void DenseExecutor::embed_token(int token_id, float* output, cudaStream_t stream) {
-    if (token_id < 0 || token_id >= (int)config_.vocab_size) {
-        LOG_ERROR("Token ID %d out of range [0, %u)", token_id, config_.vocab_size);
-        return;
-    }
-
+    if (!embedding_ || token_id < 0 || token_id >= (int)config_.vocab_size) return;
     size_t offset = (size_t)token_id * config_.hidden_dim;
     if (stream) {
         cudaMemcpyAsync(output, embedding_ + offset,
@@ -183,7 +296,7 @@ void DenseExecutor::embed_token(int token_id, float* output, cudaStream_t stream
 }
 
 // ============================================================================
-// Forward Pass (single layer)
+// Forward Pass — Real implementation using cuBLAS + CUDA kernels
 // ============================================================================
 
 void DenseExecutor::forward_layer(float* hidden, float* residual,
@@ -198,94 +311,66 @@ void DenseExecutor::forward_layer(float* hidden, float* residual,
     uint32_t kv_dim = config_.num_kv_heads * config_.head_dim;
     uint32_t inter = config_.intermediate_dim;
 
-    // --- Step 1: Attention norm ---
-    cuda::rmsnorm(norm_buf_, hidden, lw.attn_norm, hd, 1e-6f, stream);
+    // --- 1. Attention Input Norm ---
+    cuda::rmsnorm(norm_buf_, hidden, lw.attn_norm, hd, 1e-5f, stream);
 
-    // --- Step 2: Q/K/V projections ---
-    // For FP32 weights, use cuBLAS or our matvec kernels
-    // norm_buf_ → q_buf_, k_buf_, v_buf_
-    // Q: [num_heads * head_dim, hidden_dim] @ [hidden_dim] → [num_heads * head_dim]
-    // Since weights are FP32 for now, use a simple kernel dispatch
+    // --- 2. Q/K/V Projections (cuBLAS sgemv) ---
+    cuda::gemv_fp32((const float*)lw.q_proj, norm_buf_, q_buf_,
+                    qkv_dim, hd, stream);
+    cuda::gemv_fp32((const float*)lw.k_proj, norm_buf_, k_buf_,
+                    kv_dim, hd, stream);
+    cuda::gemv_fp32((const float*)lw.v_proj, norm_buf_, v_buf_,
+                    kv_dim, hd, stream);
 
-    // For the placeholder implementation, use the FP32 path
-    // In production, this would dispatch to dequant_matvec_int4 for quantized weights
-
-    // Simple GPU matvec for FP32: launch one block per output row
-    // (The dequant kernels handle quantized weights)
-    // For FP32, we can reuse the structure but without dequantization
-
-    // We'll call the existing kernel infrastructure through dispatch.h
-    // For now with FP32 weights, the dequant path doesn't apply.
-    // Use cublasSgemv or our own simple kernel.
-
-    // Placeholder: copy norm_buf_ to q/k/v (identity projection for testing)
-    cudaMemcpyAsync(q_buf_, norm_buf_, std::min((size_t)qkv_dim, (size_t)hd) * sizeof(float),
-                     cudaMemcpyDeviceToDevice, stream);
-    cudaMemcpyAsync(k_buf_, norm_buf_, std::min((size_t)kv_dim, (size_t)hd) * sizeof(float),
-                     cudaMemcpyDeviceToDevice, stream);
-    cudaMemcpyAsync(v_buf_, norm_buf_, std::min((size_t)kv_dim, (size_t)hd) * sizeof(float),
-                     cudaMemcpyDeviceToDevice, stream);
-
-    // --- Step 3: RoPE ---
+    // --- 3. RoPE ---
     cuda::apply_rope(q_buf_, k_buf_,
                      config_.num_attn_heads, config_.num_kv_heads,
                      config_.head_dim, position,
                      config_.rope_theta, config_.rope_scaling, stream);
 
-    // --- Step 4: Update KV cache ---
+    // --- 4. Update KV Cache ---
     kv_cache_.update(layer_id, position, k_buf_, v_buf_, stream);
 
-    // --- Step 5: Attention ---
+    // --- 5. Attention ---
+    int seq_len = kv_cache_.seq_len();
+    if (seq_len < 1) seq_len = 1;
     cuda::attention_decode(q_buf_,
                            kv_cache_.k_cache(layer_id),
                            kv_cache_.v_cache(layer_id),
                            attn_out_,
                            config_.num_attn_heads, config_.num_kv_heads,
-                           config_.head_dim, kv_cache_.seq_len(),
-                           stream);
+                           config_.head_dim, seq_len, stream);
 
-    // --- Step 6: O projection + residual ---
-    // attn_out_ → down_buf_ (o_proj)
-    // For now: identity (placeholder)
-    cudaMemcpyAsync(down_buf_, attn_out_,
-                     std::min((size_t)hd, (size_t)qkv_dim) * sizeof(float),
-                     cudaMemcpyDeviceToDevice, stream);
+    // --- 6. O Projection ---
+    cuda::gemv_fp32((const float*)lw.o_proj, attn_out_, down_buf_,
+                    hd, qkv_dim, stream);
 
-    // Residual: hidden = residual + o_proj_output, then norm
-    cuda::fused_add_rmsnorm(norm_buf_, residual, down_buf_,
-                             lw.ffn_norm, hd, 1e-6f, stream);
-    // hidden now contains the post-attention, pre-FFN state
+    // --- 7. Residual Add ---
+    // residual += down_buf_ (attention output)
+    cuda::vector_add(residual, residual, down_buf_, hd, stream);
 
-    // --- Step 7-10: FFN (SwiGLU) ---
-    // gate = gate_proj @ norm_buf_
-    // up   = up_proj @ norm_buf_
-    // act  = SwiGLU(gate, up)
-    // down = down_proj @ act
+    // --- 8. FFN Input Norm ---
+    cuda::rmsnorm(norm_buf_, residual, lw.ffn_norm, hd, 1e-5f, stream);
 
-    // Placeholder: gate and up are identity for testing
-    cudaMemcpyAsync(gate_buf_, norm_buf_,
-                     std::min((size_t)inter, (size_t)hd) * sizeof(float),
-                     cudaMemcpyDeviceToDevice, stream);
-    cudaMemcpyAsync(up_buf_, norm_buf_,
-                     std::min((size_t)inter, (size_t)hd) * sizeof(float),
-                     cudaMemcpyDeviceToDevice, stream);
+    // --- 9. Gate + Up Projections ---
+    cuda::gemv_fp32((const float*)lw.gate_proj, norm_buf_, gate_buf_,
+                    inter, hd, stream);
+    cuda::gemv_fp32((const float*)lw.up_proj, norm_buf_, up_buf_,
+                    inter, hd, stream);
 
+    // --- 10. SwiGLU Activation ---
     cuda::swiglu(gate_buf_, gate_buf_, up_buf_, inter, stream);
 
-    // down_proj: gate_buf_ → down_buf_
-    cudaMemcpyAsync(down_buf_, gate_buf_,
-                     std::min((size_t)hd, (size_t)inter) * sizeof(float),
-                     cudaMemcpyDeviceToDevice, stream);
+    // --- 11. Down Projection ---
+    cuda::gemv_fp32((const float*)lw.down_proj, gate_buf_, down_buf_,
+                    hd, inter, stream);
 
-    // --- Step 11: Final residual ---
-    // hidden = residual + down_buf_
-    // (For the next layer, hidden will be norm'd at the start)
-    // Use a simple add kernel
-    cuda::fused_add_rmsnorm(hidden, residual, down_buf_,
-                             lw.attn_norm, hd, 1e-6f, stream);
-    // Note: This double-norms which isn't correct — in the full implementation,
-    // we'd just do an add here and norm at the start of the next layer.
-    // The fused_add_rmsnorm is used here as a functional placeholder.
+    // --- 12. Residual Add ---
+    cuda::vector_add(residual, residual, down_buf_, hd, stream);
+
+    // Pass the updated residual as hidden for next layer
+    cudaMemcpyAsync(hidden, residual, hd * sizeof(float),
+                     cudaMemcpyDeviceToDevice, stream);
 }
 
 // ============================================================================
@@ -297,18 +382,11 @@ void DenseExecutor::compute_logits(const float* hidden, float* logits,
     cudaStream_t stream = (cudaStream_t)cuda_stream;
 
     // Final RMSNorm
-    cuda::rmsnorm(norm_buf_, hidden, final_norm_, config_.hidden_dim, 1e-6f, stream);
+    cuda::rmsnorm(norm_buf_, hidden, final_norm_, config_.hidden_dim, 1e-5f, stream);
 
-    // LM head projection: [vocab_size, hidden_dim] @ [hidden_dim] → [vocab_size]
-    // For tied weights, lm_head_ == embedding_
-    // This is a large matvec — the most expensive single operation
-
-    // Placeholder: fill logits with zeros (in production, use the actual projection)
-    cudaMemsetAsync(logits, 0, config_.vocab_size * sizeof(float), stream);
-
-    // In production with FP32 weights:
-    // cublasSgemv(handle, CUBLAS_OP_N, vocab_size, hidden_dim,
-    //             &one, lm_head_, vocab_size, norm_buf_, 1, &zero, logits, 1);
+    // LM head: [vocab_size, hidden_dim] @ [hidden_dim] → [vocab_size]
+    cuda::gemv_fp32((const float*)lm_head_, norm_buf_, logits,
+                    config_.vocab_size, config_.hidden_dim, stream);
 }
 
 // ============================================================================
@@ -319,7 +397,7 @@ size_t DenseExecutor::attention_weight_bytes(uint32_t) const {
     size_t qkv = (size_t)(config_.num_attn_heads + 2 * config_.num_kv_heads) *
                  config_.head_dim * config_.hidden_dim;
     size_t o = (size_t)config_.hidden_dim * config_.num_attn_heads * config_.head_dim;
-    return (qkv + o) * sizeof(float); // FP32 for now
+    return (qkv + o) * sizeof(float);
 }
 
 size_t DenseExecutor::ffn_weight_bytes(uint32_t) const {

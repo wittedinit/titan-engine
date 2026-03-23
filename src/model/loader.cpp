@@ -1,292 +1,403 @@
-#include "core/types.h"
+#include "model/loader.h"
 #include "core/config.h"
 #include "core/logging.h"
 
 #include <fstream>
+#include <sstream>
 #include <cstring>
-#include <vector>
-#include <unordered_map>
+#include <algorithm>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+
+#include <cuda_runtime.h>
 
 namespace titan {
 
 // ============================================================================
-// Safetensors Format Reader
-//
-// Safetensors is a simple format:
-//   [8 bytes] header_size (uint64 LE)
-//   [header_size bytes] JSON header mapping tensor names → {dtype, shape, offsets}
-//   [remaining bytes] raw tensor data
+// Safetensors JSON header parser
 // ============================================================================
 
-struct SafetensorsFile {
-    std::string path;
-    size_t header_size = 0;
-    size_t data_offset = 0;
-    int fd = -1;
-
-    struct TensorMeta {
-        std::string name;
-        std::string dtype_str;
-        std::vector<int64_t> shape;
-        size_t data_start = 0;
-        size_t data_end = 0;
-    };
-    std::vector<TensorMeta> tensors;
-};
-
-static DType parse_safetensors_dtype(const std::string& s) {
-    if (s == "F32")  return DType::FP32;
-    if (s == "F16")  return DType::FP16;
-    if (s == "BF16") return DType::BF16;
-    if (s == "I8")   return DType::INT8;
+static DType parse_st_dtype(const std::string& s) {
+    if (s == "F32")     return DType::FP32;
+    if (s == "F16")     return DType::FP16;
+    if (s == "BF16")    return DType::BF16;
+    if (s == "I8")      return DType::INT8;
+    if (s == "I32")     return DType::FP32; // Treat I32 as FP32 size
     if (s == "F8_E4M3") return DType::FP8_E4M3;
-    return DType::FP16; // Default
+    return DType::FP16;
 }
 
-// Minimal JSON parser for safetensors header
-// Extracts tensor names, dtypes, shapes, and offsets
-static bool parse_safetensors_header(const std::string& json, SafetensorsFile& sf) {
-    // This is a simplified parser for the safetensors JSON format
-    // Real implementation would use a proper JSON parser (rapidjson, nlohmann)
-
+// Parse a safetensors JSON header into tensor metadata
+static bool parse_header(const std::string& json,
+                          std::vector<SafetensorsMeta>& out) {
     size_t pos = 0;
+
     while (pos < json.size()) {
-        // Find tensor name (key)
+        // Find opening quote of key
         auto q1 = json.find('"', pos);
         if (q1 == std::string::npos) break;
         auto q2 = json.find('"', q1 + 1);
         if (q2 == std::string::npos) break;
         std::string key = json.substr(q1 + 1, q2 - q1 - 1);
 
-        // Skip __metadata__ entries
+        // Skip __metadata__
         if (key == "__metadata__") {
-            pos = json.find('}', q2) + 1;
+            // Skip the entire value (could be nested object)
+            int depth = 0;
+            pos = q2 + 1;
+            while (pos < json.size()) {
+                if (json[pos] == '{') depth++;
+                else if (json[pos] == '}') {
+                    depth--;
+                    if (depth <= 0) { pos++; break; }
+                }
+                pos++;
+            }
             continue;
         }
 
-        SafetensorsFile::TensorMeta meta;
+        // Find the value object (starts with {)
+        auto obj_start = json.find('{', q2);
+        if (obj_start == std::string::npos) break;
+
+        // Find matching close brace
+        int depth = 1;
+        size_t obj_end = obj_start + 1;
+        while (obj_end < json.size() && depth > 0) {
+            if (json[obj_end] == '{') depth++;
+            else if (json[obj_end] == '}') depth--;
+            obj_end++;
+        }
+
+        std::string obj = json.substr(obj_start, obj_end - obj_start);
+
+        SafetensorsMeta meta;
         meta.name = key;
 
-        // Find dtype
-        auto dtype_pos = json.find("\"dtype\"", q2);
-        if (dtype_pos != std::string::npos) {
-            auto dq1 = json.find('"', dtype_pos + 7);
-            auto dq2 = json.find('"', dq1 + 1);
+        // Parse dtype
+        auto dt_pos = obj.find("\"dtype\"");
+        if (dt_pos != std::string::npos) {
+            auto dq1 = obj.find('"', dt_pos + 7);
+            auto dq2 = obj.find('"', dq1 + 1);
             if (dq1 != std::string::npos && dq2 != std::string::npos) {
-                meta.dtype_str = json.substr(dq1 + 1, dq2 - dq1 - 1);
+                meta.dtype_str = obj.substr(dq1 + 1, dq2 - dq1 - 1);
+                meta.dtype = parse_st_dtype(meta.dtype_str);
             }
         }
 
-        // Find shape
-        auto shape_pos = json.find("\"shape\"", q2);
-        if (shape_pos != std::string::npos) {
-            auto bracket_start = json.find('[', shape_pos);
-            auto bracket_end = json.find(']', bracket_start);
-            if (bracket_start != std::string::npos && bracket_end != std::string::npos) {
-                std::string shape_str = json.substr(bracket_start + 1, bracket_end - bracket_start - 1);
-                // Parse comma-separated integers
+        // Parse shape
+        auto sh_pos = obj.find("\"shape\"");
+        if (sh_pos != std::string::npos) {
+            auto br1 = obj.find('[', sh_pos);
+            auto br2 = obj.find(']', br1);
+            if (br1 != std::string::npos && br2 != std::string::npos) {
+                std::string s = obj.substr(br1 + 1, br2 - br1 - 1);
                 size_t sp = 0;
-                while (sp < shape_str.size()) {
-                    while (sp < shape_str.size() && !isdigit(shape_str[sp])) sp++;
-                    if (sp >= shape_str.size()) break;
-                    meta.shape.push_back(std::stoll(shape_str.substr(sp)));
-                    while (sp < shape_str.size() && isdigit(shape_str[sp])) sp++;
+                while (sp < s.size()) {
+                    while (sp < s.size() && !isdigit(s[sp]) && s[sp] != '-') sp++;
+                    if (sp >= s.size()) break;
+                    size_t start = sp;
+                    while (sp < s.size() && (isdigit(s[sp]) || s[sp] == '-')) sp++;
+                    meta.shape.push_back(std::stoll(s.substr(start, sp - start)));
                 }
             }
         }
 
-        // Find data_offsets
-        auto off_pos = json.find("\"data_offsets\"", q2);
+        // Parse data_offsets
+        auto off_pos = obj.find("\"data_offsets\"");
         if (off_pos != std::string::npos) {
-            auto ob_start = json.find('[', off_pos);
-            auto ob_end = json.find(']', ob_start);
-            if (ob_start != std::string::npos && ob_end != std::string::npos) {
-                std::string off_str = json.substr(ob_start + 1, ob_end - ob_start - 1);
+            auto br1 = obj.find('[', off_pos);
+            auto br2 = obj.find(']', br1);
+            if (br1 != std::string::npos && br2 != std::string::npos) {
+                std::string s = obj.substr(br1 + 1, br2 - br1 - 1);
                 size_t sp = 0;
-                std::vector<size_t> offsets;
-                while (sp < off_str.size()) {
-                    while (sp < off_str.size() && !isdigit(off_str[sp])) sp++;
-                    if (sp >= off_str.size()) break;
-                    offsets.push_back(std::stoull(off_str.substr(sp)));
-                    while (sp < off_str.size() && isdigit(off_str[sp])) sp++;
+                std::vector<size_t> offs;
+                while (sp < s.size()) {
+                    while (sp < s.size() && !isdigit(s[sp])) sp++;
+                    if (sp >= s.size()) break;
+                    size_t start = sp;
+                    while (sp < s.size() && isdigit(s[sp])) sp++;
+                    offs.push_back(std::stoull(s.substr(start, sp - start)));
                 }
-                if (offsets.size() >= 2) {
-                    meta.data_start = offsets[0];
-                    meta.data_end = offsets[1];
+                if (offs.size() >= 2) {
+                    meta.data_start = offs[0];
+                    meta.data_end = offs[1];
                 }
             }
         }
 
-        sf.tensors.push_back(meta);
-
-        // Advance past the current entry
-        pos = json.find('}', q2);
-        if (pos != std::string::npos) pos++;
+        out.push_back(meta);
+        pos = obj_end;
     }
 
-    return !sf.tensors.empty();
+    return !out.empty();
 }
 
 // ============================================================================
-// Model Loading Pipeline
+// ModelLoader
 // ============================================================================
 
-// Load safetensors index (for sharded models, reads model.safetensors.index.json)
-// Returns list of shard files and tensor→shard mapping
+bool ModelLoader::load(const std::string& model_dir) {
+    model_dir_ = model_dir;
 
-struct ModelLoader {
-    ModelConfig config;
-    std::string model_dir;
-    std::vector<SafetensorsFile> shards;
-    std::unordered_map<std::string, size_t> tensor_to_shard; // tensor_name → shard index
-
-    bool load(const std::string& path) {
-        model_dir = path;
-
-        // Load model config
-        config = load_model_config(path + "/config.json");
-
-        // Check for sharded model (index file)
-        std::string index_path = path + "/model.safetensors.index.json";
-        std::ifstream index_file(index_path);
-
-        if (index_file.good()) {
-            return load_sharded(index_path);
-        }
-
-        // Single file model
-        std::string st_path = path + "/model.safetensors";
-        return load_single(st_path);
+    // Load config
+    config_ = load_model_config(model_dir + "/config.json");
+    if (config_.hidden_dim == 0) {
+        LOG_ERROR("Failed to load config.json from %s", model_dir.c_str());
+        return false;
     }
 
-    bool load_single(const std::string& st_path) {
-        std::ifstream f(st_path, std::ios::binary);
-        if (!f.good()) {
-            LOG_ERROR("Cannot open %s", st_path.c_str());
+    // Check for sharded vs single file
+    std::string index_path = model_dir + "/model.safetensors.index.json";
+    std::ifstream idx(index_path);
+    if (idx.good()) {
+        idx.close();
+        return load_sharded(index_path);
+    }
+
+    std::string single_path = model_dir + "/model.safetensors";
+    struct stat st;
+    if (stat(single_path.c_str(), &st) == 0) {
+        return load_single(single_path);
+    }
+
+    LOG_ERROR("No safetensors files found in %s", model_dir.c_str());
+    return false;
+}
+
+bool ModelLoader::load_single(const std::string& st_path) {
+    ShardInfo shard;
+    shard.path = st_path;
+
+    std::ifstream f(st_path, std::ios::binary);
+    if (!f.good()) return false;
+
+    uint64_t header_size;
+    f.read(reinterpret_cast<char*>(&header_size), 8);
+    shard.data_offset = 8 + header_size;
+
+    std::string header(header_size, '\0');
+    f.read(header.data(), header_size);
+
+    std::vector<SafetensorsMeta> metas;
+    if (!parse_header(header, metas)) {
+        LOG_ERROR("Failed to parse safetensors header");
+        return false;
+    }
+
+    size_t shard_idx = shards_.size();
+    shards_.push_back(shard);
+
+    for (auto& m : metas) {
+        tensors_[m.name] = {shard_idx, m};
+    }
+
+    LOG_INFO("Loaded %zu tensors from %s", metas.size(), st_path.c_str());
+    return true;
+}
+
+bool ModelLoader::load_sharded(const std::string& index_path) {
+    std::ifstream f(index_path);
+    std::string json((std::istreambuf_iterator<char>(f)),
+                      std::istreambuf_iterator<char>());
+
+    // Parse weight_map: {"tensor_name": "shard_filename", ...}
+    auto wm_pos = json.find("\"weight_map\"");
+    if (wm_pos == std::string::npos) {
+        LOG_ERROR("No weight_map in index");
+        return false;
+    }
+
+    auto brace = json.find('{', wm_pos + 12);
+    // Find matching close
+    int depth = 1;
+    size_t end = brace + 1;
+    while (end < json.size() && depth > 0) {
+        if (json[end] == '{') depth++;
+        else if (json[end] == '}') depth--;
+        end++;
+    }
+    std::string wm = json.substr(brace, end - brace);
+
+    // Parse tensor → filename pairs
+    std::unordered_map<std::string, std::string> weight_map;
+    size_t pos = 0;
+    while (pos < wm.size()) {
+        auto q1 = wm.find('"', pos);
+        if (q1 == std::string::npos) break;
+        auto q2 = wm.find('"', q1 + 1);
+        auto q3 = wm.find('"', q2 + 1);
+        auto q4 = wm.find('"', q3 + 1);
+        if (q4 == std::string::npos) break;
+
+        weight_map[wm.substr(q1 + 1, q2 - q1 - 1)] = wm.substr(q3 + 1, q4 - q3 - 1);
+        pos = q4 + 1;
+    }
+
+    // Group by shard file and parse each shard's header
+    std::unordered_map<std::string, size_t> file_to_idx;
+    for (const auto& [tensor, file] : weight_map) {
+        if (file_to_idx.find(file) == file_to_idx.end()) {
+            size_t idx = shards_.size();
+            file_to_idx[file] = idx;
+            ShardInfo si;
+            si.path = model_dir_ + "/" + file;
+            shards_.push_back(si);
+        }
+    }
+
+    // Parse headers for each shard
+    for (size_t i = 0; i < shards_.size(); i++) {
+        if (!parse_shard_header(i)) {
+            LOG_ERROR("Failed to parse shard %s", shards_[i].path.c_str());
             return false;
         }
-
-        SafetensorsFile sf;
-        sf.path = st_path;
-
-        // Read header size
-        uint64_t header_size;
-        f.read(reinterpret_cast<char*>(&header_size), 8);
-        sf.header_size = header_size;
-        sf.data_offset = 8 + header_size;
-
-        // Read header JSON
-        std::string header(header_size, '\0');
-        f.read(header.data(), header_size);
-
-        if (!parse_safetensors_header(header, sf)) {
-            LOG_ERROR("Failed to parse safetensors header");
-            return false;
-        }
-
-        LOG_INFO("Loaded %zu tensors from %s", sf.tensors.size(), st_path.c_str());
-
-        for (size_t i = 0; i < sf.tensors.size(); i++) {
-            tensor_to_shard[sf.tensors[i].name] = 0;
-        }
-        shards.push_back(std::move(sf));
-
-        return true;
     }
 
-    bool load_sharded(const std::string& index_path) {
-        // Read index JSON to find shard files
-        std::ifstream f(index_path);
-        std::string json((std::istreambuf_iterator<char>(f)),
-                          std::istreambuf_iterator<char>());
-
-        // Parse weight_map from index
-        auto wm_pos = json.find("\"weight_map\"");
-        if (wm_pos == std::string::npos) {
-            LOG_ERROR("No weight_map in index file");
-            return false;
-        }
-
-        // Extract tensor→filename mapping
-        std::unordered_map<std::string, std::string> weight_map;
-        size_t pos = json.find('{', wm_pos + 12);
-        size_t end = json.find('}', pos);
-        // Simplified parsing
-        std::string wm_json = json.substr(pos, end - pos + 1);
-
-        size_t p = 0;
-        while (p < wm_json.size()) {
-            auto q1 = wm_json.find('"', p);
-            if (q1 == std::string::npos) break;
-            auto q2 = wm_json.find('"', q1 + 1);
-            auto q3 = wm_json.find('"', q2 + 1);
-            auto q4 = wm_json.find('"', q3 + 1);
-            if (q4 == std::string::npos) break;
-
-            std::string tensor = wm_json.substr(q1 + 1, q2 - q1 - 1);
-            std::string file = wm_json.substr(q3 + 1, q4 - q3 - 1);
-            weight_map[tensor] = file;
-            p = q4 + 1;
-        }
-
-        // Group by shard file
-        std::unordered_map<std::string, size_t> file_to_shard;
-        for (const auto& [tensor, file] : weight_map) {
-            if (file_to_shard.find(file) == file_to_shard.end()) {
-                size_t idx = shards.size();
-                file_to_shard[file] = idx;
-
-                SafetensorsFile sf;
-                sf.path = model_dir + "/" + file;
-                shards.push_back(sf);
-            }
-            tensor_to_shard[tensor] = file_to_shard[file];
-        }
-
-        LOG_INFO("Model has %zu shards, %zu tensors", shards.size(), weight_map.size());
-
-        // Load headers for each shard
-        for (auto& sf : shards) {
-            std::ifstream sf_file(sf.path, std::ios::binary);
-            if (!sf_file.good()) {
-                LOG_ERROR("Cannot open shard %s", sf.path.c_str());
-                return false;
-            }
-
-            uint64_t header_size;
-            sf_file.read(reinterpret_cast<char*>(&header_size), 8);
-            sf.header_size = header_size;
-            sf.data_offset = 8 + header_size;
-
-            std::string header(header_size, '\0');
-            sf_file.read(header.data(), header_size);
-            parse_safetensors_header(header, sf);
-        }
-
-        return true;
+    // Map tensor names from weight_map to their shard locations
+    for (const auto& [tensor_name, file] : weight_map) {
+        size_t shard_idx = file_to_idx[file];
+        // Find tensor meta in this shard
+        // (already populated by parse_shard_header)
     }
 
-    // Get tensor descriptor by name
-    TensorDesc get_tensor_desc(const std::string& name) const {
-        TensorDesc desc;
-        desc.name = name;
+    LOG_INFO("Loaded %zu shards, %zu tensors", shards_.size(), tensors_.size());
+    return true;
+}
 
-        auto it = tensor_to_shard.find(name);
-        if (it == tensor_to_shard.end()) return desc;
+bool ModelLoader::parse_shard_header(size_t shard_idx) {
+    auto& shard = shards_[shard_idx];
 
-        const auto& sf = shards[it->second];
-        for (const auto& meta : sf.tensors) {
-            if (meta.name == name) {
-                desc.dtype = parse_safetensors_dtype(meta.dtype_str);
-                desc.shape = meta.shape;
-                desc.byte_offset = sf.data_offset + meta.data_start;
-                desc.byte_size = meta.data_end - meta.data_start;
-                break;
-            }
-        }
+    std::ifstream f(shard.path, std::ios::binary);
+    if (!f.good()) return false;
 
-        return desc;
+    uint64_t header_size;
+    f.read(reinterpret_cast<char*>(&header_size), 8);
+    shard.data_offset = 8 + header_size;
+
+    std::string header(header_size, '\0');
+    f.read(header.data(), header_size);
+
+    std::vector<SafetensorsMeta> metas;
+    if (!parse_header(header, metas)) return false;
+
+    for (auto& m : metas) {
+        tensors_[m.name] = {shard_idx, m};
     }
-};
+
+    return true;
+}
+
+bool ModelLoader::has_tensor(const std::string& name) const {
+    return tensors_.count(name) > 0;
+}
+
+SafetensorsMeta ModelLoader::get_meta(const std::string& name) const {
+    auto it = tensors_.find(name);
+    if (it == tensors_.end()) return {};
+    return it->second.meta;
+}
+
+std::vector<std::string> ModelLoader::tensor_names() const {
+    std::vector<std::string> names;
+    names.reserve(tensors_.size());
+    for (const auto& [name, _] : tensors_) {
+        names.push_back(name);
+    }
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
+// ============================================================================
+// Read tensor data
+// ============================================================================
+
+ssize_t ModelLoader::read_tensor_cpu(const std::string& name, void* dst, size_t dst_size) {
+    auto it = tensors_.find(name);
+    if (it == tensors_.end()) {
+        LOG_ERROR("Tensor not found: %s", name.c_str());
+        return -1;
+    }
+
+    const auto& loc = it->second;
+    const auto& shard = shards_[loc.shard_idx];
+    size_t bytes = loc.meta.byte_size();
+
+    if (bytes > dst_size) {
+        LOG_ERROR("Buffer too small for %s: need %zu, have %zu",
+                  name.c_str(), bytes, dst_size);
+        return -1;
+    }
+
+    // Read from file using pread
+    int fd = open(shard.path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        LOG_ERROR("Cannot open %s: %s", shard.path.c_str(), strerror(errno));
+        return -1;
+    }
+
+    off_t file_offset = shard.data_offset + loc.meta.data_start;
+    ssize_t total = 0;
+    char* buf = (char*)dst;
+
+    while ((size_t)total < bytes) {
+        ssize_t n = pread(fd, buf + total, bytes - total, file_offset + total);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;
+            break;
+        }
+        total += n;
+    }
+
+    close(fd);
+
+    if ((size_t)total != bytes) {
+        LOG_ERROR("Short read for %s: got %zd / %zu", name.c_str(), total, bytes);
+        return -1;
+    }
+
+    return total;
+}
+
+ssize_t ModelLoader::read_tensor_gpu(const std::string& name, void* dst_gpu, size_t dst_size) {
+    auto it = tensors_.find(name);
+    if (it == tensors_.end()) {
+        LOG_ERROR("Tensor not found: %s", name.c_str());
+        return -1;
+    }
+
+    size_t bytes = it->second.meta.byte_size();
+    if (bytes > dst_size) {
+        LOG_ERROR("GPU buffer too small for %s: need %zu, have %zu",
+                  name.c_str(), bytes, dst_size);
+        return -1;
+    }
+
+    // Use pinned staging buffer for fast CPU→GPU transfer
+    void* staging = nullptr;
+    cudaError_t err = cudaMallocHost(&staging, bytes);
+    if (err != cudaSuccess) {
+        // Fallback: regular malloc + cudaMemcpy
+        staging = malloc(bytes);
+        if (!staging) return -1;
+
+        ssize_t read = read_tensor_cpu(name, staging, bytes);
+        if (read > 0) {
+            cudaMemcpy(dst_gpu, staging, bytes, cudaMemcpyHostToDevice);
+        }
+        free(staging);
+        return read;
+    }
+
+    // Read to pinned memory, then async copy to GPU
+    ssize_t read = read_tensor_cpu(name, staging, bytes);
+    if (read > 0) {
+        cudaMemcpy(dst_gpu, staging, bytes, cudaMemcpyHostToDevice);
+    }
+
+    cudaFreeHost(staging);
+    return read;
+}
 
 } // namespace titan

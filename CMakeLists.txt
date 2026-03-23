@@ -87,6 +87,7 @@ add_library(titan_compute STATIC
     src/compute/cuda/activation.cu
     src/compute/cuda/sampling.cu
     src/compute/cuda/sparse.cu
+    src/compute/cuda/gemv.cu
     src/compute/cpu/matmul_avx.cpp
     src/compute/cpu/expert_cpu.cpp
 )

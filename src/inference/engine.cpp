@@ -1,5 +1,6 @@
 #include "inference/engine.h"
 #include "model/dense.h"
+#include "model/moe.h"
 #include "compute/dispatch.h"
 #include "core/logging.h"
 #include "core/config.h"
@@ -41,22 +42,25 @@ bool InferenceEngine::load_model(const std::string& model_path) {
     // Load model config to determine type
     ModelConfig model_config = load_model_config(model_path + "/config.json");
 
-    // Create appropriate executor
+    // Create appropriate executor based on model type
     if (model_config.model_type == ModelType::MOE ||
         model_config.model_type == ModelType::HYBRID_MOE) {
         LOG_INFO("Detected MoE model — using MoE executor");
-        // TODO: Use MoEExecutor when implemented
-        // For now, fall back to dense executor
-        LOG_WARN("MoE executor not yet connected — using dense executor as placeholder");
+        auto executor = std::make_unique<MoEExecutor>();
+        if (!executor->initialize(model_path, *memory_, config_)) {
+            LOG_ERROR("Failed to initialize MoE executor");
+            return false;
+        }
+        model_ = std::move(executor);
+    } else {
+        LOG_INFO("Using dense executor");
+        auto executor = std::make_unique<DenseExecutor>();
+        if (!executor->initialize(model_path, *memory_, config_)) {
+            LOG_ERROR("Failed to initialize dense executor");
+            return false;
+        }
+        model_ = std::move(executor);
     }
-
-    auto executor = std::make_unique<DenseExecutor>();
-    if (!executor->initialize(model_path, *memory_, config_)) {
-        LOG_ERROR("Failed to initialize model executor");
-        return false;
-    }
-
-    model_ = std::move(executor);
 
     // Generate execution plan
     plan_ = plan_execution(model_->config(), hw_, config_);
@@ -108,15 +112,19 @@ void InferenceEngine::generate(const std::string& prompt,
 
     auto t_start = std::chrono::steady_clock::now();
 
-    // Get DenseExecutor for embedding access
+    // Get executor for embedding access (works for both Dense and MoE)
     auto* dense = dynamic_cast<DenseExecutor*>(model_.get());
+    auto* moe = dynamic_cast<MoEExecutor*>(model_.get());
+
+    auto do_embed = [&](int token_id, float* buf) {
+        if (dense) dense->embed_token(token_id, buf);
+        else if (moe) moe->embed_token(token_id, buf);
+    };
 
     // --- Prefill Phase: Process prompt tokens ---
     for (size_t i = 0; i < prompt_tokens.size(); i++) {
         // Embedding lookup
-        if (dense) {
-            dense->embed_token(prompt_tokens[i], hidden);
-        }
+        do_embed(prompt_tokens[i], hidden);
 
         // Copy to residual stream
         cudaMemcpy(residual, hidden, hidden_bytes, cudaMemcpyDeviceToDevice);
@@ -176,9 +184,7 @@ void InferenceEngine::generate(const std::string& prompt,
         }
 
         // Embed the new token for next step
-        if (dense) {
-            dense->embed_token(token_id, hidden);
-        }
+        do_embed(token_id, hidden);
         cudaMemcpy(residual, hidden, hidden_bytes, cudaMemcpyDeviceToDevice);
 
         // Forward through all layers
