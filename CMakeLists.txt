@@ -121,9 +121,11 @@ add_library(titan_inference STATIC
 target_include_directories(titan_inference PUBLIC src)
 target_link_libraries(titan_inference PUBLIC titan_model titan_compute titan_memory)
 
-# CLI executable
+# CLI + Server executable
 add_executable(titan
     src/api/cli.cpp
+    src/api/server.cpp
+    src/api/http.cpp
 )
 target_link_libraries(titan PRIVATE titan_inference titan_model titan_compute titan_memory titan_core)
 

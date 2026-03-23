@@ -11,6 +11,12 @@
 
 using namespace titan;
 
+// Forward declaration from server.cpp
+namespace titan {
+    int run_server(InferenceEngine& engine, const std::string& model_name,
+                   const std::string& host, int port);
+}
+
 static void print_banner() {
     printf("\n");
     printf("  ████████╗██╗████████╗ █████╗ ███╗   ██╗\n");
@@ -38,14 +44,23 @@ static void print_usage(const char* prog) {
 "  --top-k K              Top-k sampling (default: 40)\n"
 "  --max-tokens N         Max tokens to generate (default: 2048)\n"
 "  --no-prefetch          Disable expert prefetching\n"
+"  --serve                Start as HTTP API server (OpenAI-compatible)\n"
+"  --host HOST            Server bind address (default: 0.0.0.0)\n"
+"  --port PORT            Server port (default: 8080)\n"
 "  --hardware             Print hardware info and exit\n"
 "  -v, --verbose          Verbose logging\n"
 "  -h, --help             Show this help\n\n"
 "Examples:\n"
 "  %s -m ./llama-8b -q q4_k\n"
 "  %s -m ./deepseek-v3 -q int4 --vram 28000\n"
-"  %s -m ./kimi-k2.5 -q q3_k --max-tokens 4096\n\n",
-    prog, prog, prog, prog);
+"  %s -m ./kimi-k2.5 -q q3_k --max-tokens 4096\n\n"
+"Server mode:\n"
+"  %s -m ./llama-8b -q q4_k --serve --port 8080\n\n"
+"  Then use with any OpenAI client:\n"
+"    curl http://localhost:8080/v1/chat/completions \\\n"
+"      -H 'Content-Type: application/json' \\\n"
+"      -d '{\"model\":\"llama\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}]}'\n\n",
+    prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char** argv) {
@@ -58,6 +73,9 @@ int main(int argc, char** argv) {
     // Parse sampling params alongside runtime config
     SamplingParams sampling;
     bool verbose = false;
+    bool serve_mode = false;
+    std::string serve_host = "0.0.0.0";
+    int serve_port = 8080;
 
     // Check simple flags
     for (int i = 1; i < argc; i++) {
@@ -92,6 +110,9 @@ int main(int argc, char** argv) {
         else if (arg == "--top-p") sampling.top_p = std::stof(next());
         else if (arg == "--top-k") sampling.top_k = std::stoul(next());
         else if (arg == "--max-tokens") sampling.max_tokens = std::stoul(next());
+        else if (arg == "--serve") serve_mode = true;
+        else if (arg == "--host") serve_host = next();
+        else if (arg == "--port") serve_port = std::stoi(next());
     }
 
     if (config.model_path.empty()) {
@@ -123,6 +144,13 @@ int main(int argc, char** argv) {
     printf("Quant: %s | Context: %u | Temp: %.1f\n",
            dtype_name(config.weight_dtype), config.max_context_len,
            sampling.temperature);
+
+    // Server mode: start HTTP API instead of interactive chat
+    if (serve_mode) {
+        printf("\nStarting API server on %s:%d...\n\n", serve_host.c_str(), serve_port);
+        return run_server(engine, engine.model_config().name, serve_host, serve_port);
+    }
+
     printf("Type 'exit' or 'quit' to stop. Ctrl+C to abort.\n");
     printf("\n");
 
