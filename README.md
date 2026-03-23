@@ -308,33 +308,32 @@ titan-engine/
 
 ## Status
 
-**v0.1.0** — Complete inference pipeline with all core components implemented and connected.
+**v0.2.0** — Full roadmap implemented. All core features complete.
 
-### What Works
-- Full forward pass: embedding → 32+ layers → logits → sampling → text output
-- Dense executor with cuBLAS FP32 and INT4 dequant dispatch
-- MoE executor with pre-allocated buffers, expert routing, shared experts, 3-tier memory
-- BPE tokenizer (HuggingFace tokenizer.json)
-- Safetensors loader (single + sharded, FP16→FP32 auto-conversion)
-- GGUF loader (v3, all quant types, auto-detection)
-- KV cache (GPU-resident, per-position update)
-- Hardware auto-detection (GPU, CPU, RAM, NVMe, RAID)
-- Execution planner (automatic VRAM/RAM/NVMe weight placement)
-- 8 CUDA kernel files (dequant, attention, norms, activations, MoE, sampling, sparse, gemv)
-- CPU AVX-512 expert execution path
-- Activation sparsity system (profiler + predictor + sparse kernels)
-- MoE-ification tool (dense → MoE conversion)
-- Interactive CLI with streaming output
-
-### Roadmap
-- [ ] Speculative decoding (draft model + self-speculative)
-- [ ] OpenAI-compatible HTTP API server
-- [ ] Python bindings (pybind11)
-- [ ] FP4 Blackwell native Tensor Core kernels
-- [ ] Continuous batching for multi-user serving
-- [ ] Expert prefetching with io_uring pipelining
-- [ ] Benchmarking suite with automated regression testing
-- [ ] Titan native format (pre-quantized, layout-optimized)
+### Implemented
+- [x] Full forward pass: embedding → N layers → logits → sampling → text output
+- [x] Dense executor with cuBLAS FP32 and INT4 dequant dispatch
+- [x] MoE executor with pre-allocated double-buffered expert staging, 3-tier memory
+- [x] BPE tokenizer (HuggingFace tokenizer.json)
+- [x] Safetensors loader (single + sharded, FP16→FP32 auto-conversion)
+- [x] GGUF loader (v3, all GGML quant types, auto-detection)
+- [x] KV cache (GPU-resident, per-position update)
+- [x] Hardware auto-detection (GPU, CPU, RAM, NVMe, RAID)
+- [x] Execution planner (automatic VRAM/RAM/NVMe weight placement)
+- [x] 9 CUDA kernel files (dequant, attention, norms, activations, MoE, sampling, sparse, gemv, FP4)
+- [x] CPU AVX-512 expert execution path
+- [x] Activation sparsity system (profiler + predictor + sparse kernels)
+- [x] MoE-ification tool (dense → MoE conversion)
+- [x] Interactive CLI with streaming output
+- [x] **OpenAI-compatible HTTP API server** (SSE streaming, /v1/chat/completions)
+- [x] **Speculative decoding** (draft model + self-speculative + rejection sampling)
+- [x] **Python bindings** (pybind11: Engine.load, generate, chat, encode, decode)
+- [x] **FP4 Blackwell Tensor Core kernels** (E2M1 dequant + quantization)
+- [x] **Continuous batching** (per-request KV slots, dynamic scheduling)
+- [x] **Expert prefetcher** (frequency + temporal prediction, pre-allocated aligned buffers, I/O thread pool)
+- [x] **Benchmarking suite** (TTFT, tok/s, VRAM, quant sweeps, regression testing)
+- [x] **Titan native format** (pre-quantized, layout-optimized, manifest.json index)
+- [x] **NVIDIA FP4 converter** (BF16 → NVFP4/MXFP4 via Model Optimizer)
 
 ## Contributing
 
