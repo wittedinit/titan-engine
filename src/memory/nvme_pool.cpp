@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <cstring>
+#include <atomic>
 #include <thread>
 #include <queue>
 #include <condition_variable>

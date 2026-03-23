@@ -171,12 +171,16 @@ __global__ void dequant_matvec_int2_kernel(
 
 // ============================================================================
 // FP8 MatVec (for Ada Lovelace / Blackwell GPUs)
+// Requires CUDA 12.x with cuda_fp8.h — guarded with preprocessor check
 // ============================================================================
 
+#if defined(__CUDA_FP8_TYPES_EXIST__)
+#include <cuda_fp8.h>
+
 __global__ void matvec_fp8_kernel(
-    const __nv_fp8_e4m3* __restrict__ weights,  // FP8 weights [rows, cols]
-    const float*         __restrict__ input,     // FP32 input [cols]
-    float*               __restrict__ output,    // FP32 output [rows]
+    const __nv_fp8_e4m3* __restrict__ weights,
+    const float*         __restrict__ input,
+    float*               __restrict__ output,
     int rows, int cols
 ) {
     int row = blockIdx.x;
@@ -190,13 +194,11 @@ __global__ void matvec_fp8_kernel(
 
     float acc = 0.0f;
     const __nv_fp8_e4m3* row_w = weights + (size_t)row * cols;
-
     for (int col = threadIdx.x; col < cols; col += blockDim.x) {
         float w = (float)row_w[col];
         acc += w * shared_input[col];
     }
 
-    // Warp reduction
     for (int offset = 16; offset > 0; offset >>= 1) {
         acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
     }
@@ -214,6 +216,7 @@ __global__ void matvec_fp8_kernel(
         if (lane_id == 0) output[row] = acc;
     }
 }
+#endif // __CUDA_FP8_TYPES_EXIST__
 
 // ============================================================================
 // Launch Wrappers
