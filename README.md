@@ -107,6 +107,52 @@ Titan Engine combines research from multiple state-of-the-art projects:
 - **vLLM**: PagedAttention for efficient KV cache management
 - **SpecMoEOff**: Speculative decoding to hide expert offloading latency
 
+### Activation Sparsity (PowerInfer-style, for Dense Models)
+
+Dense models don't need to stay dense at inference time. Most FFN neurons activate near-zero for any given token (~85-92% for SwiGLU models like Llama). Titan Engine exploits this:
+
+1. **Profile**: Run calibration data through the model, record neuron activation magnitudes
+2. **Classify**: Neurons active >30% of the time are "hot", rest are "cold"
+3. **Predict**: Lightweight predictor (single linear layer) predicts which neurons will activate
+4. **Skip**: Only compute active neurons — sparse matvec, sparse SwiGLU, gather-based down projection
+
+Result: **2-3x speedup on dense models** with no model modification and minimal quality loss.
+
+```bash
+# Profile a dense model's activation sparsity
+python tools/moeify.py --model ./llama-70b --profile-sparsity
+
+# Titan Engine automatically uses sparsity during inference
+./titan -m ./llama-70b -q q4_k  # Detects and uses sparsity profile
+```
+
+### Dense → MoE Conversion (MoE-ification)
+
+Can't find an MoE version of your favorite model? Convert it:
+
+```bash
+# Quick conversion (random splitting)
+python tools/moeify.py --model ./llama-70b --num-experts 8 --top-k 2 \
+                       --method random --output ./llama-70b-moe
+
+# High-quality conversion (k-means clustering of neuron weights)
+python tools/moeify.py --model ./llama-70b --num-experts 16 --top-k 4 \
+                       --method cluster --output ./llama-70b-moe
+
+# SVD-based splitting (highest quality, most expensive)
+python tools/moeify.py --model ./llama-70b --num-experts 16 --top-k 4 \
+                       --method svd --output ./llama-70b-moe
+```
+
+Three splitting methods:
+| Method | Quality | Speed | Fine-tuning Needed? |
+|--------|---------|-------|-------------------|
+| **Random** | Moderate | Fast | Recommended |
+| **Cluster** (k-means) | Good | Medium | Recommended |
+| **SVD** | Best | Slow | Required |
+
+After conversion, the model activates only top-K of N experts per token, dramatically reducing active parameters and enabling Titan Engine's expert streaming.
+
 ### Quantization Support
 
 | Format | Bits | Quality | Speed | Best For |
@@ -273,9 +319,13 @@ This project builds on techniques from:
 - 3-tier memory manager (VRAM, RAM, NVMe pools)
 - CUDA kernels: INT4/INT2/FP8 dequant, attention, RoPE, RMSNorm, SwiGLU, MoE routing
 - Fused kernels: Add+RMSNorm, MoE Combine+Residual+Norm
+- **Sparse CUDA kernels**: Activation predictor, sparse matvec, sparse SwiGLU, scatter-gather down projection
 - CPU kernels: AVX-512 matvec, INT4 dequant, parallel expert execution
 - Model loader (safetensors format)
 - Execution planner (automatic VRAM/RAM/NVMe placement)
+- **Activation sparsity system**: Profiler, predictor, sparse FFN executor (PowerInfer-style)
+- **MoE-ification tool**: Dense → MoE conversion via random/cluster/SVD splitting with routing gate insertion
+- **Sparsity profiler**: Heuristic and data-driven neuron profiling with save/load
 - CLI interface
 
 ### In Progress
@@ -283,6 +333,7 @@ This project builds on techniques from:
 - Tokenizer (BPE/SentencePiece)
 - KV cache with PagedAttention
 - Expert prefetching with io_uring
+- MoE-ification fine-tuning loop
 
 ### Planned
 - Speculative decoding

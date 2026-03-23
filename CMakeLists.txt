@@ -86,6 +86,7 @@ add_library(titan_compute STATIC
     src/compute/cuda/norm.cu
     src/compute/cuda/activation.cu
     src/compute/cuda/sampling.cu
+    src/compute/cuda/sparse.cu
     src/compute/cpu/matmul_avx.cpp
     src/compute/cpu/expert_cpu.cpp
 )
@@ -102,6 +103,7 @@ add_library(titan_model STATIC
     src/model/dense.cpp
     src/model/moe.cpp
     src/model/tokenizer.cpp
+    src/model/sparsity.cpp
 )
 target_include_directories(titan_model PUBLIC src)
 target_link_libraries(titan_model PUBLIC titan_core titan_compute titan_memory)
