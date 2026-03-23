@@ -13,7 +13,32 @@ namespace titan { namespace cuda {
     void vector_add(float* y, const float* a, const float* b, int n, cudaStream_t stream);
     void init_cublas();
     void destroy_cublas();
+    void dequant_matvec_int4(const void* weights, const void* scales, const void* biases,
+                             const float* input, float* output,
+                             int rows, int cols, int group_size, cudaStream_t stream);
 }}
+
+// Dispatch matvec based on weight format
+static void matvec_dispatch(
+    DType dtype, int group_size,
+    const void* weight, const void* scales, const void* biases,
+    const float* input, float* output,
+    int rows, int cols, cudaStream_t stream
+) {
+    switch (dtype) {
+        case titan::DType::INT4:
+        case titan::DType::Q4_K:
+            titan::cuda::dequant_matvec_int4(weight, scales, biases,
+                                              input, output, rows, cols,
+                                              group_size, stream);
+            break;
+        default:
+            // FP32 path via cuBLAS
+            titan::cuda::gemv_fp32((const float*)weight, input, output,
+                                   rows, cols, stream);
+            break;
+    }
+}
 
 namespace titan {
 
@@ -314,13 +339,16 @@ void DenseExecutor::forward_layer(float* hidden, float* residual,
     // --- 1. Attention Input Norm ---
     cuda::rmsnorm(norm_buf_, hidden, lw.attn_norm, hd, 1e-5f, stream);
 
-    // --- 2. Q/K/V Projections (cuBLAS sgemv) ---
-    cuda::gemv_fp32((const float*)lw.q_proj, norm_buf_, q_buf_,
-                    qkv_dim, hd, stream);
-    cuda::gemv_fp32((const float*)lw.k_proj, norm_buf_, k_buf_,
-                    kv_dim, hd, stream);
-    cuda::gemv_fp32((const float*)lw.v_proj, norm_buf_, v_buf_,
-                    kv_dim, hd, stream);
+    // --- 2. Q/K/V Projections ---
+    matvec_dispatch(weight_format_, quant_group_size_,
+                    lw.q_proj, lw.q_proj_scales, lw.q_proj_biases,
+                    norm_buf_, q_buf_, qkv_dim, hd, stream);
+    matvec_dispatch(weight_format_, quant_group_size_,
+                    lw.k_proj, lw.k_proj_scales, lw.k_proj_biases,
+                    norm_buf_, k_buf_, kv_dim, hd, stream);
+    matvec_dispatch(weight_format_, quant_group_size_,
+                    lw.v_proj, lw.v_proj_scales, lw.v_proj_biases,
+                    norm_buf_, v_buf_, kv_dim, hd, stream);
 
     // --- 3. RoPE ---
     cuda::apply_rope(q_buf_, k_buf_,
@@ -342,8 +370,9 @@ void DenseExecutor::forward_layer(float* hidden, float* residual,
                            config_.head_dim, seq_len, stream);
 
     // --- 6. O Projection ---
-    cuda::gemv_fp32((const float*)lw.o_proj, attn_out_, down_buf_,
-                    hd, qkv_dim, stream);
+    matvec_dispatch(weight_format_, quant_group_size_,
+                    lw.o_proj, lw.o_proj_scales, lw.o_proj_biases,
+                    attn_out_, down_buf_, hd, qkv_dim, stream);
 
     // --- 7. Residual Add ---
     // residual += down_buf_ (attention output)
@@ -353,17 +382,20 @@ void DenseExecutor::forward_layer(float* hidden, float* residual,
     cuda::rmsnorm(norm_buf_, residual, lw.ffn_norm, hd, 1e-5f, stream);
 
     // --- 9. Gate + Up Projections ---
-    cuda::gemv_fp32((const float*)lw.gate_proj, norm_buf_, gate_buf_,
-                    inter, hd, stream);
-    cuda::gemv_fp32((const float*)lw.up_proj, norm_buf_, up_buf_,
-                    inter, hd, stream);
+    matvec_dispatch(weight_format_, quant_group_size_,
+                    lw.gate_proj, lw.gate_proj_scales, lw.gate_proj_biases,
+                    norm_buf_, gate_buf_, inter, hd, stream);
+    matvec_dispatch(weight_format_, quant_group_size_,
+                    lw.up_proj, lw.up_proj_scales, lw.up_proj_biases,
+                    norm_buf_, up_buf_, inter, hd, stream);
 
     // --- 10. SwiGLU Activation ---
     cuda::swiglu(gate_buf_, gate_buf_, up_buf_, inter, stream);
 
     // --- 11. Down Projection ---
-    cuda::gemv_fp32((const float*)lw.down_proj, gate_buf_, down_buf_,
-                    hd, inter, stream);
+    matvec_dispatch(weight_format_, quant_group_size_,
+                    lw.down_proj, lw.down_proj_scales, lw.down_proj_biases,
+                    gate_buf_, down_buf_, hd, inter, stream);
 
     // --- 12. Residual Add ---
     cuda::vector_add(residual, residual, down_buf_, hd, stream);

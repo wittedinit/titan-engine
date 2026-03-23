@@ -1,9 +1,12 @@
 #include "inference/engine.h"
 #include "model/dense.h"
 #include "model/moe.h"
+#include "model/gguf_loader.h"
 #include "compute/dispatch.h"
 #include "core/logging.h"
 #include "core/config.h"
+
+#include <sys/stat.h>
 
 #include <cuda_runtime.h>
 #include <chrono>
@@ -31,16 +34,47 @@ bool InferenceEngine::load_model(const std::string& model_path) {
         return false;
     }
 
-    // Load tokenizer
-    if (!tokenizer_.load(model_path)) {
-        LOG_ERROR("Failed to load tokenizer from %s", model_path.c_str());
-        return false;
+    // Detect model format: GGUF (single file) vs HuggingFace (directory)
+    bool is_gguf = false;
+    {
+        struct stat st;
+        if (stat(model_path.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+            // Single file — check if GGUF
+            if (model_path.size() > 5 &&
+                model_path.substr(model_path.size() - 5) == ".gguf") {
+                is_gguf = true;
+            }
+        }
     }
-    LOG_INFO("Tokenizer loaded: %d tokens, BOS=%d EOS=%d",
-             tokenizer_.vocab_size(), tokenizer_.bos_id(), tokenizer_.eos_id());
 
-    // Load model config to determine type
-    ModelConfig model_config = load_model_config(model_path + "/config.json");
+    ModelConfig model_config;
+
+    if (is_gguf) {
+        LOG_INFO("Detected GGUF format: %s", model_path.c_str());
+        GGUFLoader gguf;
+        if (!gguf.load(model_path)) {
+            LOG_ERROR("Failed to load GGUF file");
+            return false;
+        }
+        model_config = gguf.to_model_config();
+        LOG_INFO("GGUF model: %s (%uL, h=%u, %zu tensors)",
+                 model_config.name.c_str(), model_config.num_layers,
+                 model_config.hidden_dim, gguf.tensor_names().size());
+
+        // GGUF tokenizer is embedded — use BOS=1 EOS=2 defaults for now
+        // Full GGUF tokenizer extraction would parse the vocab from metadata
+        LOG_WARN("GGUF tokenizer not yet extracted — using defaults (BOS=1, EOS=2)");
+    } else {
+        // HuggingFace directory format
+        if (!tokenizer_.load(model_path)) {
+            LOG_WARN("Tokenizer not found in %s — generation will work but text I/O limited",
+                     model_path.c_str());
+        } else {
+            LOG_INFO("Tokenizer loaded: %d tokens, BOS=%d EOS=%d",
+                     tokenizer_.vocab_size(), tokenizer_.bos_id(), tokenizer_.eos_id());
+        }
+        model_config = load_model_config(model_path + "/config.json");
+    }
 
     // Create appropriate executor based on model type
     if (model_config.model_type == ModelType::MOE ||

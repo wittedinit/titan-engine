@@ -68,6 +68,9 @@ private:
     KVCache kv_cache_;
 
     // Per-layer weights (pointers into VRAM/RAM)
+    DType weight_format_ = DType::FP32;  // Format of loaded weights
+    int quant_group_size_ = 64;          // Group size for quantized weights
+
     struct LayerWeights {
         // Attention norms
         float* attn_norm = nullptr;     // [hidden_dim]

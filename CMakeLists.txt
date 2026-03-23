@@ -105,6 +105,7 @@ add_library(titan_model STATIC
     src/model/moe.cpp
     src/model/tokenizer.cpp
     src/model/sparsity.cpp
+    src/model/gguf_loader.cpp
 )
 target_include_directories(titan_model PUBLIC src)
 target_link_libraries(titan_model PUBLIC titan_core titan_compute titan_memory)

@@ -10,11 +10,8 @@ namespace titan {
 // ============================================================================
 // MoE Transformer Executor
 //
-// Extends the dense executor with expert routing and 3-tier expert management:
-// - Attention weights always in VRAM (same as dense)
-// - Shared experts always in VRAM
-// - Routed experts: cached in RAM with LRU, loaded from NVMe on miss
-// - Expert forward: on GPU if in VRAM, on CPU if in RAM
+// Extends the dense executor with expert routing and 3-tier expert management.
+// Pre-allocates all GPU scratch buffers at init to avoid per-token cudaMalloc.
 // ============================================================================
 
 class MoEExecutor : public ModelArchitecture {
@@ -52,7 +49,7 @@ private:
     MemoryManager* memory_ = nullptr;
     KVCache kv_cache_;
 
-    // Attention weights (always in VRAM, same as dense)
+    // Attention weights (always VRAM)
     struct AttentionWeights {
         float* attn_norm = nullptr;
         float* ffn_norm = nullptr;
@@ -63,36 +60,42 @@ private:
     };
     std::vector<AttentionWeights> attn_weights_;
 
-    // MoE-specific per layer
+    // MoE per-layer state
     struct MoELayerState {
-        float* gate_weight = nullptr;   // [num_experts, hidden_dim] routing gate
-        // Shared expert weights (always in VRAM)
+        float* gate_weight = nullptr;   // [num_experts, hidden_dim]
         void* shared_gate_proj = nullptr;
         void* shared_up_proj = nullptr;
         void* shared_down_proj = nullptr;
     };
     std::vector<MoELayerState> moe_state_;
 
-    // Expert weights path (for loading from NVMe/disk)
     std::string expert_dir_;
-    size_t expert_bytes_ = 0;  // Bytes per expert
+    size_t expert_bytes_ = 0;
 
     // Embedding + LM head
     float* embedding_ = nullptr;
     void* lm_head_ = nullptr;
     float* final_norm_ = nullptr;
 
-    // Scratch buffers
+    // Pre-allocated scratch buffers (no per-token mallocs!)
     float* q_buf_ = nullptr;
     float* k_buf_ = nullptr;
     float* v_buf_ = nullptr;
     float* attn_out_ = nullptr;
     float* norm_buf_ = nullptr;
-    float* gate_logits_ = nullptr;     // [num_experts]
-    float* routing_weights_ = nullptr; // [experts_per_tok]
-    int*   routing_indices_ = nullptr; // [experts_per_tok]
-    float* expert_outputs_ = nullptr;  // [experts_per_tok, hidden_dim]
-    float* shared_out_ = nullptr;      // [hidden_dim]
+    float* gate_logits_ = nullptr;
+    float* routing_weights_ = nullptr;
+    int*   routing_indices_ = nullptr;
+    float* expert_outputs_ = nullptr;  // [max_k, hidden_dim]
+    float* shared_out_ = nullptr;
+
+    // Pre-allocated expert compute buffers (double-buffered for overlap)
+    float* expert_weight_buf_[2] = {};  // Two buffers for double-buffering
+    size_t expert_weight_buf_size_ = 0; // Size of each buffer in bytes
+    float* expert_gate_out_ = nullptr;  // [moe_intermediate]
+    float* expert_up_out_ = nullptr;    // [moe_intermediate]
+    float* shared_gate_out_ = nullptr;  // [moe_intermediate]
+    float* shared_up_out_ = nullptr;    // [moe_intermediate]
 
     void allocate_buffers();
     void free_buffers();
