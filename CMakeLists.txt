@@ -88,6 +88,7 @@ add_library(titan_compute STATIC
     src/compute/cuda/sampling.cu
     src/compute/cuda/sparse.cu
     src/compute/cuda/gemv.cu
+    src/compute/cuda/fp4.cu
     src/compute/cpu/matmul_avx.cpp
     src/compute/cpu/expert_cpu.cpp
 )
@@ -144,4 +145,19 @@ if(TITAN_BUILD_TESTS)
     add_executable(test_kernels tests/test_kernels.cu)
     target_link_libraries(test_kernels PRIVATE titan_compute titan_core CUDA::cudart)
     add_test(NAME test_kernels COMMAND test_kernels)
+endif()
+
+# Python bindings (optional, requires pybind11)
+option(TITAN_BUILD_PYTHON "Build Python bindings" OFF)
+if(TITAN_BUILD_PYTHON)
+    find_package(pybind11 QUIET)
+    if(pybind11_FOUND)
+        pybind11_add_module(titan_python src/api/python/titan_bindings.cpp)
+        target_link_libraries(titan_python PRIVATE titan_inference titan_model titan_compute titan_memory titan_core)
+        target_compile_definitions(titan_python PRIVATE TITAN_BUILD_PYTHON)
+        set_target_properties(titan_python PROPERTIES OUTPUT_NAME "titan")
+        message(STATUS "Python bindings: enabled")
+    else()
+        message(WARNING "pybind11 not found — Python bindings disabled")
+    endif()
 endif()
