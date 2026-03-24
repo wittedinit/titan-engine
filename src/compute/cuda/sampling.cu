@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
+#include <cstdint>
 #include <cfloat>
 
 namespace titan {

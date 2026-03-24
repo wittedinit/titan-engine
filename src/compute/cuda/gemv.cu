@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cstdint>
 
 namespace titan {
 namespace cuda {
