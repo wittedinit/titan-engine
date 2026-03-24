@@ -64,7 +64,7 @@ def check_dependencies():
         deps["torch_bf16"] = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
         if torch.cuda.is_available():
             deps["gpu_name"] = torch.cuda.get_device_name(0)
-            deps["gpu_memory_gb"] = torch.cuda.get_device_properties(0).total_mem / 1e9
+            deps["gpu_memory_gb"] = torch.cuda.get_device_properties(0).total_memory / 1e9
     except ImportError:
         deps["torch"] = False
 
