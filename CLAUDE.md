@@ -2,6 +2,20 @@
 
 Universal LLM inference engine — run models up to 1T parameters on consumer hardware.
 
+## Project Overview
+
+Primary languages: C++17, CUDA, Python. Tools include convert_nvfp4.py, convert_titan.py, benchmark.py, moeify.py. Always verify README accuracy against actual installation steps before committing.
+
+## General Rules
+
+- After building a tool or engine in this project, use it — don't suggest external alternatives (e.g., don't suggest vLLM when we just built Titan Engine for that purpose).
+- Never assume public infrastructure, relay servers, or TURN servers unless explicitly approved.
+- Do not make UI changes, rename buttons, or modify user-facing labels unless explicitly requested. Keep changes scoped to what was asked.
+
+## Git & PR Workflow
+
+- When working on PRs, never push commits to already-merged branches. Always check PR/branch status before pushing.
+
 ## Build & Run
 
 ```bash
@@ -32,13 +46,13 @@ Supports HuggingFace safetensors directories and GGUF files (auto-detected).
 ## Directory Layout
 
 - `src/core/` — Types, config (HF config.json parser), hardware detection, logging
-- `src/memory/` — 3-tier memory manager (VRAM pool, pinned RAM pool, NVMe io_uring pool)
-- `src/compute/cuda/` — 8 CUDA kernel files (dequant, gemv, attention, MoE, norms, activation, sampling, sparse)
+- `src/memory/` — 3-tier memory manager (VRAM pool, pinned RAM pool, NVMe io_uring pool), expert prefetcher
+- `src/compute/cuda/` — 9 CUDA kernel files (dequant, gemv, fp4, attention, MoE, norms, activation, sampling, sparse)
 - `src/compute/cpu/` — AVX-512 CPU kernels for RAM-resident expert execution
 - `src/model/` — Safetensors loader, GGUF loader, BPE tokenizer, dense executor, MoE executor, sparsity system
-- `src/inference/` — Engine orchestrator (prefill + decode), KV cache, scheduler stubs
-- `src/api/` — Interactive CLI chat with colored streaming output
-- `tools/` — moeify.py (dense→MoE conversion + sparsity profiling), convert.py, benchmark.py
+- `src/inference/` — Engine orchestrator (prefill + decode), KV cache, speculative decoding, continuous batching
+- `src/api/` — Interactive CLI, OpenAI-compatible HTTP server (SSE streaming), Python bindings (pybind11)
+- `tools/` — moeify.py, convert.py, convert_nvfp4.py, convert_titan.py, benchmark.py
 - `tests/` — Kernel correctness tests (CUDA vs CPU reference), type tests
 
 ## Weight Loading Flow
@@ -53,6 +67,7 @@ Supports HuggingFace safetensors directories and GGUF files (auto-detected).
 `matvec_dispatch()` in dense.cpp routes based on `weight_format_`:
 - `DType::FP32` → `cuda::gemv_fp32()` (cuBLAS sgemv)
 - `DType::INT4` / `DType::Q4_K` → `cuda::dequant_matvec_int4()` (custom kernel with FMA trick)
+- `DType::FP4` → `cuda::dequant_matvec_fp4()` (FP4 E2M1 with constant LUT, Blackwell native)
 
 ## Conventions
 
