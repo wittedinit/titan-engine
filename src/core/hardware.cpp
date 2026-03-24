@@ -25,14 +25,15 @@
 #endif
 #endif
 
+// CUDA headers MUST be included OUTSIDE of namespace titan
+// to avoid pulling CUDA runtime symbols into our namespace
+#include <cuda_runtime.h>
+
 namespace titan {
 
 // ============================================================================
 // GPU Detection (CUDA)
 // ============================================================================
-
-// We link against CUDA runtime — use the proper headers
-#include <cuda_runtime.h>
 
 std::vector<GpuInfo> detect_gpus() {
     std::vector<GpuInfo> gpus;
