@@ -1,4 +1,5 @@
 #include "core/types.h"
+#include "cuda_check.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
@@ -235,6 +236,7 @@ void dequant_matvec_int4(
         (const uint32_t*)weights, (const half*)scales, (const half*)biases,
         input, output, rows, cols, group_size
     );
+    CUDA_CHECK_LAUNCH();
 }
 
 void dequant_matvec_int2(
@@ -249,6 +251,7 @@ void dequant_matvec_int2(
         (const uint32_t*)weights, (const half*)scales, (const half*)biases,
         input, output, rows, cols, group_size
     );
+    CUDA_CHECK_LAUNCH();
 }
 
 } // namespace cuda

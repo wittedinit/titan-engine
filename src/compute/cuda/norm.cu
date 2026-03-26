@@ -1,3 +1,4 @@
+#include "cuda_check.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
@@ -141,6 +142,7 @@ void rmsnorm(float* output, const float* input, const float* weight,
     rmsnorm_kernel<<<1, threads, shared_mem, stream>>>(
         output, input, weight, dim, eps
     );
+    CUDA_CHECK_LAUNCH();
 }
 
 void layernorm(float* output, const float* input,
@@ -151,6 +153,7 @@ void layernorm(float* output, const float* input,
     layernorm_kernel<<<1, threads, shared_mem, stream>>>(
         output, input, weight, bias, dim, eps
     );
+    CUDA_CHECK_LAUNCH();
 }
 
 } // namespace cuda

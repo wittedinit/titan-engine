@@ -178,6 +178,7 @@ void ExpertPrefetcher::prefetch(uint32_t layer,
 
 bool ExpertPrefetcher::is_ready(uint32_t layer, uint32_t expert_id) const {
     uint64_t key = ((uint64_t)layer << 32) | expert_id;
+    std::lock_guard<std::mutex> lock(buffer_mutex_);
     for (const auto& buf : buffers_) {
         if (buf.key == key && buf.valid) return true;
     }
@@ -245,7 +246,7 @@ void ExpertPrefetcher::io_worker() {
 
         // Read expert data from NVMe
         char path[512];
-        snprintf(path, sizeof(path), "%s/experts/layer_%02u.bin",
+        snprintf(path, sizeof(path), "%s/layer_%02u.bin",
                  expert_dir_.c_str(), req.layer);
 
         int flags = O_RDONLY;
@@ -263,7 +264,18 @@ void ExpertPrefetcher::io_worker() {
             fd = open(path, O_RDONLY);
         }
 
-        if (fd >= 0) {
+        if (fd < 0) {
+            // Failed to open — clear in_flight so the buffer slot is not leaked
+            uint64_t key = ((uint64_t)req.layer << 32) | req.expert_id;
+            std::lock_guard<std::mutex> lock(buffer_mutex_);
+            for (auto& b : buffers_) {
+                if (b.key == key && b.in_flight) {
+                    b.in_flight = false;
+                    b.valid = false;
+                    break;
+                }
+            }
+        } else {
             off_t offset = (off_t)req.expert_id * req.expert_bytes;
             ssize_t total = 0;
             char* buf = (char*)req.destination;
@@ -279,16 +291,15 @@ void ExpertPrefetcher::io_worker() {
             }
             close(fd);
 
-            // Mark buffer as valid
-            if ((size_t)total == req.expert_bytes) {
-                uint64_t key = ((uint64_t)req.layer << 32) | req.expert_id;
-                std::lock_guard<std::mutex> lock(buffer_mutex_);
-                for (auto& b : buffers_) {
-                    if (b.key == key && b.in_flight) {
+            uint64_t key = ((uint64_t)req.layer << 32) | req.expert_id;
+            std::lock_guard<std::mutex> lock(buffer_mutex_);
+            for (auto& b : buffers_) {
+                if (b.key == key && b.in_flight) {
+                    if ((size_t)total == req.expert_bytes) {
                         b.valid = true;
-                        b.in_flight = false;
-                        break;
                     }
+                    b.in_flight = false;
+                    break;
                 }
             }
         }

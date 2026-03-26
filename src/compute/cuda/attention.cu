@@ -1,4 +1,5 @@
 #include "core/types.h"
+#include "cuda_check.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
@@ -71,8 +72,14 @@ __global__ void attention_decode_kernel(
     extern __shared__ float shared[];
     float* scores = shared;                        // [seq_len]
     float* out_accum = shared + seq_len;           // [head_dim]
+    // Reuse out_accum area for warp partials (needs max 32 floats, head_dim >= 32)
+    float* warp_buf = out_accum;                   // [num_warps] temp during reductions
 
     const float* qh = q + head * head_dim;
+
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+    int num_warps = (blockDim.x + 31) / 32;
 
     // Step 1: Compute attention scores (Q @ K^T)
     for (int pos = threadIdx.x; pos < seq_len; pos += blockDim.x) {
@@ -86,36 +93,53 @@ __global__ void attention_decode_kernel(
     __syncthreads();
 
     // Step 2: Softmax over scores
-    // Find max for numerical stability
+    // Find max for numerical stability — proper cross-warp reduction
     float max_val = -1e30f;
     for (int pos = threadIdx.x; pos < seq_len; pos += blockDim.x) {
         max_val = fmaxf(max_val, scores[pos]);
     }
-    // Warp reduce max
+    // Intra-warp reduce max
     for (int offset = 16; offset > 0; offset >>= 1) {
         max_val = fmaxf(max_val, __shfl_down_sync(0xFFFFFFFF, max_val, offset));
     }
-    __shared__ float block_max;
-    if (threadIdx.x == 0) block_max = max_val;
+    // Cross-warp reduce: each warp's lane 0 writes partial to shared memory
+    if (lane_id == 0) warp_buf[warp_id] = max_val;
     __syncthreads();
-    max_val = block_max;
+    // Warp 0 reduces across all warp partials
+    if (warp_id == 0) {
+        max_val = (lane_id < num_warps) ? warp_buf[lane_id] : -1e30f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            max_val = fmaxf(max_val, __shfl_down_sync(0xFFFFFFFF, max_val, offset));
+        }
+        if (lane_id == 0) warp_buf[0] = max_val;
+    }
+    __syncthreads();
+    max_val = warp_buf[0];
 
-    // Exp and sum
+    // Exp and sum — proper cross-warp reduction
     float sum_exp = 0.0f;
     for (int pos = threadIdx.x; pos < seq_len; pos += blockDim.x) {
         scores[pos] = expf(scores[pos] - max_val);
         sum_exp += scores[pos];
     }
-    // Warp reduce sum
+    // Intra-warp reduce sum
     for (int offset = 16; offset > 0; offset >>= 1) {
         sum_exp += __shfl_down_sync(0xFFFFFFFF, sum_exp, offset);
     }
-    __shared__ float block_sum;
-    if (threadIdx.x == 0) block_sum = sum_exp;
+    // Cross-warp reduce sum
+    if (lane_id == 0) warp_buf[warp_id] = sum_exp;
+    __syncthreads();
+    if (warp_id == 0) {
+        sum_exp = (lane_id < num_warps) ? warp_buf[lane_id] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum_exp += __shfl_down_sync(0xFFFFFFFF, sum_exp, offset);
+        }
+        if (lane_id == 0) warp_buf[0] = sum_exp;
+    }
     __syncthreads();
 
     // Normalize
-    float inv_sum = 1.0f / (block_sum + 1e-8f);
+    float inv_sum = 1.0f / (warp_buf[0] + 1e-8f);
     for (int pos = threadIdx.x; pos < seq_len; pos += blockDim.x) {
         scores[pos] *= inv_sum;
     }
@@ -148,6 +172,7 @@ void apply_rope(
         q, k, num_heads, num_kv_heads, head_dim,
         position, theta, scaling
     );
+    CUDA_CHECK_LAUNCH();
 }
 
 void attention_decode(
@@ -164,6 +189,7 @@ void attention_decode(
         q, k_cache, v_cache, output,
         num_heads, num_kv_heads, head_dim, seq_len, scale
     );
+    CUDA_CHECK_LAUNCH();
 }
 
 } // namespace cuda

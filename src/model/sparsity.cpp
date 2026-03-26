@@ -232,7 +232,7 @@ void SparseFfnExecutor::forward(
     uint32_t layer_id,
     DType weight_dtype,
     int group_size,
-    void* cuda_stream
+    cudaStream_t cuda_stream
 ) {
     if (layer_id >= profile_.layers.size()) {
         LOG_ERROR("Layer %u out of range for sparsity profile", layer_id);
@@ -240,7 +240,7 @@ void SparseFfnExecutor::forward(
     }
 
     const auto& np = profile_.layers[layer_id];
-    cudaStream_t stream = (cudaStream_t)cuda_stream;
+    cudaStream_t stream = cuda_stream;
 
     // If predictor is available, use dynamic prediction
     // Otherwise, use static hot neuron set from profile

@@ -220,7 +220,7 @@ def convert_model(args):
         # Group by layer
         for l in range(num_layers):
             layer_experts = {k: v for k, v in expert_tensors.items()
-                           if f".{l}." in k}
+                           if f".layers.{l}." in k}
             if layer_experts:
                 fname = f"experts/layer_{l:02d}.bin"
                 entries = write_tensors(layer_experts, fname)

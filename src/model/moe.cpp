@@ -7,18 +7,38 @@
 #include <cstring>
 #include <algorithm>
 
-namespace titan { namespace cuda {
-    void gemv_fp32(const float* A, const float* x, float* y,
-                   int rows, int cols, cudaStream_t stream);
-    void vector_add(float* y, const float* a, const float* b, int n, cudaStream_t stream);
-    void init_cublas();
-    void destroy_cublas();
-}}
+// All CUDA function declarations come from compute/dispatch.h (included above)
 
 namespace titan {
 
 MoEExecutor::~MoEExecutor() {
     free_buffers();
+
+    // Free model weight allocations
+    if (embedding_) { cudaFree(embedding_); embedding_ = nullptr; }
+    // Only free lm_head_ if it's a separate allocation (not tied to embedding_)
+    if (lm_head_ && lm_head_ != embedding_) { cudaFree(lm_head_); }
+    lm_head_ = nullptr;
+    if (final_norm_) { cudaFree(final_norm_); final_norm_ = nullptr; }
+
+    for (auto& aw : attn_weights_) {
+        if (aw.attn_norm) cudaFree(aw.attn_norm);
+        if (aw.ffn_norm) cudaFree(aw.ffn_norm);
+        if (aw.q_proj) cudaFree(aw.q_proj);
+        if (aw.k_proj) cudaFree(aw.k_proj);
+        if (aw.v_proj) cudaFree(aw.v_proj);
+        if (aw.o_proj) cudaFree(aw.o_proj);
+    }
+    attn_weights_.clear();
+
+    for (auto& ms : moe_state_) {
+        if (ms.gate_weight) cudaFree(ms.gate_weight);
+        if (ms.shared_gate_proj) cudaFree(ms.shared_gate_proj);
+        if (ms.shared_up_proj) cudaFree(ms.shared_up_proj);
+        if (ms.shared_down_proj) cudaFree(ms.shared_down_proj);
+    }
+    moe_state_.clear();
+
     cuda::destroy_cublas();
 }
 
@@ -101,12 +121,35 @@ bool MoEExecutor::initialize(const std::string& model_path,
     uint32_t vocab = config_.vocab_size;
     uint32_t moe_inter = config_.moe_intermediate_dim;
 
-    // Embedding
+    // Embedding — handle FP16/BF16 conversion to FP32
     cudaMalloc(&embedding_, vocab * hd * sizeof(float));
     cudaMemset(embedding_, 0, vocab * hd * sizeof(float));
     if (loader.has_tensor("model.embed_tokens.weight")) {
-        loader.read_tensor_gpu("model.embed_tokens.weight", embedding_,
-                                loader.get_meta("model.embed_tokens.weight").byte_size());
+        auto emb_meta = loader.get_meta("model.embed_tokens.weight");
+        bool emb_needs_convert = (emb_meta.dtype == DType::FP16 || emb_meta.dtype == DType::BF16);
+        if (emb_needs_convert) {
+            size_t num_elem = emb_meta.numel();
+            size_t raw_bytes = emb_meta.byte_size();
+            std::vector<uint16_t> fp16_data(num_elem);
+            loader.read_tensor_cpu("model.embed_tokens.weight", fp16_data.data(), raw_bytes);
+            std::vector<float> fp32_data(num_elem);
+            for (size_t i = 0; i < num_elem; i++) {
+                uint16_t h = fp16_data[i];
+                uint32_t sign = (h >> 15) & 1;
+                uint32_t exp_bits = (h >> 10) & 0x1F;
+                uint32_t mant = h & 0x3FF;
+                uint32_t f;
+                if (exp_bits == 0) {
+                    if (mant == 0) { f = sign << 31; }
+                    else { exp_bits = 1; while (!(mant & 0x400)) { mant <<= 1; exp_bits--; } mant &= 0x3FF; f = (sign << 31) | ((exp_bits + 127 - 15) << 23) | (mant << 13); }
+                } else if (exp_bits == 31) { f = (sign << 31) | 0x7F800000 | (mant << 13); }
+                else { f = (sign << 31) | ((exp_bits + 127 - 15) << 23) | (mant << 13); }
+                memcpy(&fp32_data[i], &f, 4);
+            }
+            cudaMemcpy(embedding_, fp32_data.data(), num_elem * sizeof(float), cudaMemcpyHostToDevice);
+        } else {
+            loader.read_tensor_gpu("model.embed_tokens.weight", embedding_, emb_meta.byte_size());
+        }
     }
 
     // Final norm
@@ -213,10 +256,10 @@ void MoEExecutor::embed_token(int token_id, float* output, cudaStream_t stream) 
 
 void MoEExecutor::forward_layer(float* hidden, float* residual,
                                  uint32_t layer_id, int position,
-                                 void* cuda_stream) {
+                                 cudaStream_t cuda_stream) {
     if (layer_id >= config_.num_layers) return;
 
-    cudaStream_t stream = (cudaStream_t)cuda_stream;
+    cudaStream_t stream = cuda_stream;
     const auto& aw = attn_weights_[layer_id];
     const auto& ms = moe_state_[layer_id];
     uint32_t hd = config_.hidden_dim;
@@ -256,9 +299,9 @@ void MoEExecutor::forward_layer(float* hidden, float* residual,
     cuda::moe_topk(gate_logits_, routing_weights_, routing_indices_,
                    config_.num_experts, config_.experts_per_tok, stream);
 
-    int h_indices[32];
     int k = config_.experts_per_tok;
-    cudaMemcpy(h_indices, routing_indices_, k * sizeof(int), cudaMemcpyDeviceToHost);
+    std::vector<int> h_indices(k);
+    cudaMemcpy(h_indices.data(), routing_indices_, k * sizeof(int), cudaMemcpyDeviceToHost);
 
     cudaMemset(expert_outputs_, 0, k * hd * sizeof(float));
 
@@ -301,17 +344,21 @@ void MoEExecutor::forward_layer(float* hidden, float* residual,
     }
 
     // Combine: weighted sum of experts + shared + residual → hidden
+    // Use next layer's attn_norm, or final_norm_ for the last layer
+    float* next_norm = (layer_id + 1 < config_.num_layers)
+                       ? attn_weights_[layer_id + 1].attn_norm
+                       : final_norm_;
     float shared_w = (config_.num_shared_experts > 0) ? 1.0f : 0.0f;
     cuda::fused_moe_combine_norm(
         hidden, residual, expert_outputs_, routing_weights_,
         (config_.num_shared_experts > 0) ? shared_out_ : nullptr, shared_w,
-        aw.attn_norm, hd, k, 1e-5f, stream
+        next_norm, hd, k, 1e-5f, stream
     );
 }
 
 void MoEExecutor::compute_logits(const float* hidden, float* logits,
-                                  void* cuda_stream) {
-    cudaStream_t stream = (cudaStream_t)cuda_stream;
+                                  cudaStream_t cuda_stream) {
+    cudaStream_t stream = cuda_stream;
     cuda::rmsnorm(norm_buf_, hidden, final_norm_, config_.hidden_dim, 1e-5f, stream);
     cuda::gemv_fp32((const float*)lm_head_, norm_buf_, logits,
                     config_.vocab_size, config_.hidden_dim, stream);

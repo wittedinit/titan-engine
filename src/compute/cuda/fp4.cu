@@ -1,3 +1,4 @@
+#include "cuda_check.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
@@ -154,6 +155,7 @@ void dequant_matvec_fp4(
         (const uint32_t*)weights, (const half*)scales,
         input, output, rows, cols, group_size
     );
+    CUDA_CHECK_LAUNCH();
 }
 
 void quantize_fp4(
@@ -167,6 +169,7 @@ void quantize_fp4(
         input, (uint32_t*)output, (half*)scales,
         numel, group_size
     );
+    CUDA_CHECK_LAUNCH();
 }
 
 } // namespace cuda

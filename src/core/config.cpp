@@ -124,6 +124,49 @@ ModelConfig load_model_config(const std::string& config_path) {
     return cfg;
 }
 
+RuntimeConfig load_runtime_config(const std::string& config_path) {
+    RuntimeConfig cfg;
+
+    std::ifstream f(config_path);
+    if (!f.good()) {
+        LOG_WARN("Cannot open runtime config: %s — using defaults", config_path.c_str());
+        return cfg;
+    }
+
+    std::stringstream ss;
+    ss << f.rdbuf();
+    std::string json = ss.str();
+
+    // Parse runtime settings from JSON
+    std::string model = json_string(json, "model_path", "");
+    if (!model.empty()) cfg.model_path = model;
+
+    std::string quant = json_string(json, "weight_dtype", "");
+    if (quant == "fp16") cfg.weight_dtype = DType::FP16;
+    else if (quant == "fp4") cfg.weight_dtype = DType::FP4;
+    else if (quant == "int4" || quant == "q4") cfg.weight_dtype = DType::INT4;
+    else if (quant == "q4_k") cfg.weight_dtype = DType::Q4_K;
+    else if (quant == "int8" || quant == "q8") cfg.weight_dtype = DType::INT8;
+
+    int64_t ctx = json_int(json, "max_context_len", 0);
+    if (ctx > 0) cfg.max_context_len = (uint32_t)ctx;
+
+    int64_t vram = json_int(json, "vram_budget_mb", 0);
+    if (vram > 0) cfg.vram_budget_mb = (uint64_t)vram;
+
+    int64_t ram = json_int(json, "ram_budget_mb", 0);
+    if (ram > 0) cfg.ram_budget_mb = (uint64_t)ram;
+
+    int64_t threads = json_int(json, "io_threads", 0);
+    if (threads > 0) cfg.io_threads = (uint32_t)threads;
+
+    std::string nvme = json_string(json, "nvme_cache_path", "");
+    if (!nvme.empty()) cfg.nvme_cache_path = nvme;
+
+    LOG_INFO("Loaded runtime config from: %s", config_path.c_str());
+    return cfg;
+}
+
 RuntimeConfig parse_cli_args(int argc, char** argv) {
     RuntimeConfig cfg;
 

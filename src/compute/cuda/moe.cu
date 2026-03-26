@@ -1,7 +1,9 @@
+#include "cuda_check.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
 #include <cfloat>
+#include <cassert>
 
 namespace titan {
 namespace cuda {
@@ -10,7 +12,7 @@ namespace cuda {
 // MoE Routing Gate: hidden_state @ gate_weight -> logits -> softmax -> topK
 // ============================================================================
 
-// Step 1: Gate projection (hidden_state × gate_weight^T → expert logits)
+// Step 1: Gate projection (hidden_state x gate_weight^T -> expert logits)
 __global__ void moe_gate_kernel(
     const float* __restrict__ hidden,       // [hidden_dim]
     const float* __restrict__ gate_weight,  // [num_experts, hidden_dim]
@@ -118,6 +120,11 @@ __global__ void moe_topk_kernel(
 // This kernel handles a single expert. Multiple experts are launched
 // as separate kernel instances on different streams for parallelism.
 // For INT4 experts, use dequant_matvec_int4 instead.
+//
+// IMPORTANT: This kernel MUST be launched with gridDim.x == 1 (single block).
+// It uses __syncthreads() between phases to synchronize access to the shared
+// scratch buffer. With multiple blocks, __syncthreads() only syncs within a
+// block, causing a race condition on scratch.
 // ============================================================================
 
 __global__ void expert_forward_fp32_kernel(
@@ -131,6 +138,10 @@ __global__ void expert_forward_fp32_kernel(
 ) {
     // This is a reference implementation.
     // In practice, use cuBLAS or the dequant kernels for quantized weights.
+    //
+    // Single-block only: all threads cooperate through __syncthreads().
+    // assert(gridDim.x == 1) cannot be called in device code, but the
+    // launch wrapper enforces this.
 
     extern __shared__ float shared_input[];
     for (int i = threadIdx.x; i < hidden_dim; i += blockDim.x) {
@@ -142,8 +153,7 @@ __global__ void expert_forward_fp32_kernel(
     float* up_out = scratch + inter_dim;
 
     // Gate projection: gate_out = gate_proj @ input
-    for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < inter_dim;
-         row += gridDim.x * blockDim.x) {
+    for (int row = threadIdx.x; row < inter_dim; row += blockDim.x) {
         float dot = 0.0f;
         for (int col = 0; col < hidden_dim; col++) {
             dot += gate_proj[row * hidden_dim + col] * shared_input[col];
@@ -153,8 +163,7 @@ __global__ void expert_forward_fp32_kernel(
     __syncthreads();
 
     // Up projection: up_out = up_proj @ input
-    for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < inter_dim;
-         row += gridDim.x * blockDim.x) {
+    for (int row = threadIdx.x; row < inter_dim; row += blockDim.x) {
         float dot = 0.0f;
         for (int col = 0; col < hidden_dim; col++) {
             dot += up_proj[row * hidden_dim + col] * shared_input[col];
@@ -164,8 +173,7 @@ __global__ void expert_forward_fp32_kernel(
     __syncthreads();
 
     // SwiGLU activation: act_out = SiLU(gate_out) * up_out
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < inter_dim;
-         i += gridDim.x * blockDim.x) {
+    for (int i = threadIdx.x; i < inter_dim; i += blockDim.x) {
         float g = gate_out[i];
         float sigmoid_g = 1.0f / (1.0f + expf(-g));
         gate_out[i] = (g * sigmoid_g) * up_out[i]; // Reuse gate_out as scratch
@@ -173,8 +181,7 @@ __global__ void expert_forward_fp32_kernel(
     __syncthreads();
 
     // Down projection: output = down_proj @ act_out
-    for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < hidden_dim;
-         row += gridDim.x * blockDim.x) {
+    for (int row = threadIdx.x; row < hidden_dim; row += blockDim.x) {
         float dot = 0.0f;
         for (int col = 0; col < inter_dim; col++) {
             dot += down_proj[row * inter_dim + col] * gate_out[col];
@@ -194,6 +201,7 @@ void moe_gate(const float* hidden, const float* gate_weight, float* logits,
     moe_gate_kernel<<<num_experts, threads, shared_mem, stream>>>(
         hidden, gate_weight, logits, hidden_dim, num_experts
     );
+    CUDA_CHECK_LAUNCH();
 }
 
 void moe_topk(const float* logits, float* weights, int* indices,
@@ -202,6 +210,25 @@ void moe_topk(const float* logits, float* weights, int* indices,
     moe_topk_kernel<<<1, 32, shared_mem, stream>>>(
         logits, weights, indices, num_experts, k
     );
+    CUDA_CHECK_LAUNCH();
+}
+
+void expert_forward_fp32(
+    const float* input,
+    const float* gate_proj, const float* up_proj, const float* down_proj,
+    float* output, float* scratch,
+    int hidden_dim, int inter_dim, cudaStream_t stream
+) {
+    // MUST launch with exactly 1 block to avoid cross-block race on scratch.
+    // The kernel uses __syncthreads() between phases which only syncs within
+    // a single block.
+    int threads = 1024;
+    int shared_mem = hidden_dim * sizeof(float);
+    expert_forward_fp32_kernel<<<1, threads, shared_mem, stream>>>(
+        input, gate_proj, up_proj, down_proj, output, scratch,
+        hidden_dim, inter_dim
+    );
+    CUDA_CHECK_LAUNCH();
 }
 
 } // namespace cuda

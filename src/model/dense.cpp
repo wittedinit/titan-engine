@@ -6,17 +6,7 @@
 #include <cuda_runtime.h>
 #include <cstring>
 
-// Forward declarations for gemv.cu
-namespace titan { namespace cuda {
-    void gemv_fp32(const float* A, const float* x, float* y,
-                   int rows, int cols, cudaStream_t stream);
-    void vector_add(float* y, const float* a, const float* b, int n, cudaStream_t stream);
-    void init_cublas();
-    void destroy_cublas();
-    void dequant_matvec_int4(const void* weights, const void* scales, const void* biases,
-                             const float* input, float* output,
-                             int rows, int cols, int group_size, cudaStream_t stream);
-}}
+// All CUDA function declarations come from compute/dispatch.h (included above)
 
 // Dispatch matvec based on weight format
 static void matvec_dispatch(
@@ -44,6 +34,43 @@ namespace titan {
 
 DenseExecutor::~DenseExecutor() {
     free_scratch_buffers();
+
+    // Free model weight allocations
+    if (embedding_) { cudaFree(embedding_); embedding_ = nullptr; }
+    // Only free lm_head_ if it's a separate allocation (not tied to embedding_)
+    if (lm_head_ && lm_head_ != embedding_) { cudaFree(lm_head_); }
+    lm_head_ = nullptr;
+    if (lm_head_scales_) { cudaFree(lm_head_scales_); lm_head_scales_ = nullptr; }
+    if (lm_head_biases_) { cudaFree(lm_head_biases_); lm_head_biases_ = nullptr; }
+    if (final_norm_) { cudaFree(final_norm_); final_norm_ = nullptr; }
+
+    for (auto& lw : layer_weights_) {
+        if (lw.attn_norm) cudaFree(lw.attn_norm);
+        if (lw.ffn_norm) cudaFree(lw.ffn_norm);
+        if (lw.q_proj) cudaFree(lw.q_proj);
+        if (lw.q_proj_scales) cudaFree(lw.q_proj_scales);
+        if (lw.q_proj_biases) cudaFree(lw.q_proj_biases);
+        if (lw.k_proj) cudaFree(lw.k_proj);
+        if (lw.k_proj_scales) cudaFree(lw.k_proj_scales);
+        if (lw.k_proj_biases) cudaFree(lw.k_proj_biases);
+        if (lw.v_proj) cudaFree(lw.v_proj);
+        if (lw.v_proj_scales) cudaFree(lw.v_proj_scales);
+        if (lw.v_proj_biases) cudaFree(lw.v_proj_biases);
+        if (lw.o_proj) cudaFree(lw.o_proj);
+        if (lw.o_proj_scales) cudaFree(lw.o_proj_scales);
+        if (lw.o_proj_biases) cudaFree(lw.o_proj_biases);
+        if (lw.gate_proj) cudaFree(lw.gate_proj);
+        if (lw.gate_proj_scales) cudaFree(lw.gate_proj_scales);
+        if (lw.gate_proj_biases) cudaFree(lw.gate_proj_biases);
+        if (lw.up_proj) cudaFree(lw.up_proj);
+        if (lw.up_proj_scales) cudaFree(lw.up_proj_scales);
+        if (lw.up_proj_biases) cudaFree(lw.up_proj_biases);
+        if (lw.down_proj) cudaFree(lw.down_proj);
+        if (lw.down_proj_scales) cudaFree(lw.down_proj_scales);
+        if (lw.down_proj_biases) cudaFree(lw.down_proj_biases);
+    }
+    layer_weights_.clear();
+
     cuda::destroy_cublas();
 }
 
@@ -77,13 +104,7 @@ void DenseExecutor::free_scratch_buffers() {
 static float* load_tensor_to_gpu(ModelLoader& loader, const std::string& name,
                                   size_t expected_elements = 0) {
     if (!loader.has_tensor(name)) {
-        LOG_WARN("Tensor not found: %s (will use zeros)", name.c_str());
-        if (expected_elements > 0) {
-            float* buf = nullptr;
-            cudaMalloc(&buf, expected_elements * sizeof(float));
-            cudaMemset(buf, 0, expected_elements * sizeof(float));
-            return buf;
-        }
+        LOG_WARN("Tensor not found: %s", name.c_str());
         return nullptr;
     }
 
@@ -204,18 +225,24 @@ bool DenseExecutor::load_weights(const std::string& model_path) {
 
     // Embedding
     LOG_INFO("Loading embedding...");
-    embedding_ = load_tensor_to_gpu(loader, "model.embed_tokens.weight", vocab * hd);
+    bool embedding_from_lm_head = false;
+    embedding_ = load_tensor_to_gpu(loader, "model.embed_tokens.weight");
     if (!embedding_) {
-        // Try alternative names
-        embedding_ = load_tensor_to_gpu(loader, "lm_head.weight", vocab * hd);
+        // Try alternative names — use lm_head.weight as fallback
+        embedding_ = load_tensor_to_gpu(loader, "lm_head.weight");
+        if (embedding_) embedding_from_lm_head = true;
     }
 
     // Final norm
     final_norm_ = load_norm_weights(loader, "model.norm.weight", hd);
 
     // LM head (may be tied with embedding)
-    if (loader.has_tensor("lm_head.weight")) {
-        lm_head_ = load_tensor_to_gpu(loader, "lm_head.weight", vocab * hd);
+    if (embedding_from_lm_head) {
+        // Embedding was loaded from lm_head.weight — tie weights (no duplicate alloc)
+        lm_head_ = embedding_;
+        LOG_INFO("LM head tied with embedding (shared lm_head.weight)");
+    } else if (loader.has_tensor("lm_head.weight")) {
+        lm_head_ = load_tensor_to_gpu(loader, "lm_head.weight");
     } else {
         lm_head_ = embedding_; // Weight tying
         LOG_INFO("LM head tied with embedding");
@@ -326,10 +353,10 @@ void DenseExecutor::embed_token(int token_id, float* output, cudaStream_t stream
 
 void DenseExecutor::forward_layer(float* hidden, float* residual,
                                    uint32_t layer_id, int position,
-                                   void* cuda_stream) {
+                                   cudaStream_t cuda_stream) {
     if (layer_id >= config_.num_layers) return;
 
-    cudaStream_t stream = (cudaStream_t)cuda_stream;
+    cudaStream_t stream = cuda_stream;
     const auto& lw = layer_weights_[layer_id];
     uint32_t hd = config_.hidden_dim;
     uint32_t qkv_dim = config_.num_attn_heads * config_.head_dim;
@@ -410,14 +437,17 @@ void DenseExecutor::forward_layer(float* hidden, float* residual,
 // ============================================================================
 
 void DenseExecutor::compute_logits(const float* hidden, float* logits,
-                                    void* cuda_stream) {
-    cudaStream_t stream = (cudaStream_t)cuda_stream;
+                                    cudaStream_t cuda_stream) {
+    cudaStream_t stream = cuda_stream;
 
     // Final RMSNorm
     cuda::rmsnorm(norm_buf_, hidden, final_norm_, config_.hidden_dim, 1e-5f, stream);
 
     // LM head: [vocab_size, hidden_dim] @ [hidden_dim] → [vocab_size]
-    cuda::gemv_fp32((const float*)lm_head_, norm_buf_, logits,
+    // Use matvec_dispatch to handle quantized lm_head_ correctly
+    matvec_dispatch(weight_format_, quant_group_size_,
+                    lm_head_, lm_head_scales_, lm_head_biases_,
+                    norm_buf_, logits,
                     config_.vocab_size, config_.hidden_dim, stream);
 }
 

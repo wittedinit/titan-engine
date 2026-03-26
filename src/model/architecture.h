@@ -2,6 +2,7 @@
 
 #include "core/types.h"
 #include "memory/memory_manager.h"
+#include <cuda_runtime.h>
 
 namespace titan {
 
@@ -31,11 +32,11 @@ public:
     // position: current sequence position (for RoPE)
     virtual void forward_layer(float* hidden, float* residual,
                                uint32_t layer_id, int position,
-                               void* cuda_stream) = 0;
+                               cudaStream_t cuda_stream) = 0;
 
     // Compute logits from final hidden state
     virtual void compute_logits(const float* hidden, float* logits,
-                                void* cuda_stream) = 0;
+                                cudaStream_t cuda_stream) = 0;
 
     // Get memory requirements for planning
     virtual size_t attention_weight_bytes(uint32_t layer_id) const = 0;
@@ -46,6 +47,10 @@ public:
     // Update KV cache with new key/value for given position
     virtual void update_kv_cache(uint32_t layer_id, int position,
                                  const float* key, const float* value) = 0;
+
+    // Embedding lookup: map token_id to hidden state vector on GPU
+    virtual void embed_token(int token_id, float* output,
+                             cudaStream_t stream = nullptr) = 0;
 };
 
 } // namespace titan

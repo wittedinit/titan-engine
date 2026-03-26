@@ -13,6 +13,7 @@ BatchScheduler::~BatchScheduler() {
     if (batch_hidden_) cudaFree(batch_hidden_);
     if (batch_residual_) cudaFree(batch_residual_);
     if (batch_logits_) cudaFree(batch_logits_);
+    if (batch_sampled_tokens_) cudaFree(batch_sampled_tokens_);
 }
 
 bool BatchScheduler::initialize(ModelArchitecture* model,
@@ -32,6 +33,7 @@ bool BatchScheduler::initialize(ModelArchitecture* model,
     cudaMalloc(&batch_hidden_, bs * hd * sizeof(float));
     cudaMalloc(&batch_residual_, bs * hd * sizeof(float));
     cudaMalloc(&batch_logits_, bs * vocab * sizeof(float));
+    cudaMalloc(&batch_sampled_tokens_, bs * sizeof(int));
 
     // Initialize KV cache slots
     kv_slots_.resize(config.kv_cache_slots);
@@ -166,7 +168,6 @@ void BatchScheduler::schedule_iteration() {
 
 void BatchScheduler::prefill_requests(std::vector<InferenceRequest*>& reqs) {
     uint32_t hd = model_->config().hidden_dim;
-    auto* dense = dynamic_cast<DenseExecutor*>(model_);
 
     for (auto* req : reqs) {
         if (req->prefill_pos >= (int)req->prompt_tokens.size()) {
@@ -180,7 +181,7 @@ void BatchScheduler::prefill_requests(std::vector<InferenceRequest*>& reqs) {
         float* hidden = batch_hidden_; // Use first slot for serial prefill
         float* residual = batch_residual_;
 
-        if (dense) dense->embed_token(token, hidden);
+        model_->embed_token(token, hidden);
         cudaMemcpy(residual, hidden, hd * sizeof(float), cudaMemcpyDeviceToDevice);
 
         for (uint32_t layer = 0; layer < model_->config().num_layers; layer++) {
@@ -199,23 +200,24 @@ void BatchScheduler::prefill_requests(std::vector<InferenceRequest*>& reqs) {
 void BatchScheduler::decode_step(std::vector<InferenceRequest*>& reqs) {
     uint32_t hd = model_->config().hidden_dim;
     uint32_t vocab = model_->config().vocab_size;
-    auto* dense = dynamic_cast<DenseExecutor*>(model_);
 
     // For each decoding request, generate one token
     // (True batched decode would run all in a single forward pass)
-    for (auto* req : reqs) {
-        float* hidden = batch_hidden_;
-        float* residual = batch_residual_;
-        float* logits = batch_logits_;
+    for (int req_idx = 0; req_idx < (int)reqs.size(); req_idx++) {
+        auto* req = reqs[req_idx];
+
+        // Bug #8 fix: Index into batched buffers using req_idx, not always offset 0
+        float* hidden = batch_hidden_ + req_idx * hd;
+        float* residual = batch_residual_ + req_idx * hd;
+        float* logits = batch_logits_ + req_idx * vocab;
 
         int position = (int)req->prompt_tokens.size() + (int)req->output_tokens.size();
 
         // Get logits
         model_->compute_logits(hidden, logits, nullptr);
 
-        // Sample
-        int* d_token;
-        cudaMalloc(&d_token, sizeof(int));
+        // Bug #9 fix: Use pre-allocated token output slot instead of per-step cudaMalloc
+        int* d_token = batch_sampled_tokens_ + req_idx;
         uint64_t rng = position * 6364136223846793005ULL + req->id;
         cuda::sample_token(logits, d_token, vocab,
                           req->sampling.temperature, req->sampling.top_p,
@@ -223,7 +225,6 @@ void BatchScheduler::decode_step(std::vector<InferenceRequest*>& reqs) {
 
         int token;
         cudaMemcpy(&token, d_token, sizeof(int), cudaMemcpyDeviceToHost);
-        cudaFree(d_token);
 
         // Check EOS
         if (tokenizer_ && token == tokenizer_->eos_id()) {
@@ -247,11 +248,9 @@ void BatchScheduler::decode_step(std::vector<InferenceRequest*>& reqs) {
             req->on_token(token, text);
         }
 
-        // Embed for next step
-        if (dense) {
-            dense->embed_token(token, hidden);
-            cudaMemcpy(residual, hidden, hd * sizeof(float), cudaMemcpyDeviceToDevice);
-        }
+        // Embed for next step (uses virtual method)
+        model_->embed_token(token, hidden);
+        cudaMemcpy(residual, hidden, hd * sizeof(float), cudaMemcpyDeviceToDevice);
 
         for (uint32_t layer = 0; layer < model_->config().num_layers; layer++) {
             model_->forward_layer(hidden, residual, layer, position, nullptr);

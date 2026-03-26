@@ -1,6 +1,8 @@
+#include "cuda_check.h"
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cstdint>
+#include <mutex>
 
 namespace titan {
 namespace cuda {
@@ -13,13 +15,14 @@ namespace cuda {
 // ============================================================================
 
 static cublasHandle_t g_cublas_handle = nullptr;
+static std::once_flag g_cublas_init_flag;
 
 void init_cublas() {
-    if (!g_cublas_handle) {
+    std::call_once(g_cublas_init_flag, []() {
         cublasCreate(&g_cublas_handle);
         // Use Tensor Cores when available
         cublasSetMathMode(g_cublas_handle, CUBLAS_DEFAULT_MATH);
-    }
+    });
 }
 
 void destroy_cublas() {
@@ -30,7 +33,7 @@ void destroy_cublas() {
 }
 
 // y = A @ x
-// A: [rows, cols] row-major → cuBLAS treats as col-major [cols, rows]
+// A: [rows, cols] row-major -> cuBLAS treats as col-major [cols, rows]
 // x: [cols]
 // y: [rows]
 void gemv_fp32(
@@ -39,14 +42,17 @@ void gemv_fp32(
     cudaStream_t stream
 ) {
     init_cublas();
-    if (stream) cublasSetStream(g_cublas_handle, stream);
+    // Always set stream — if stream is nullptr, this sets the default stream,
+    // which is correct. Skipping this when stream==nullptr would leave whatever
+    // stream was set by a previous call, causing execution on the wrong stream.
+    cublasSetStream(g_cublas_handle, stream);
 
     float alpha = 1.0f, beta = 0.0f;
     // cuBLAS is col-major, our weights are row-major
     // A[rows, cols] row-major = A^T[cols, rows] col-major
     // y = A @ x in row-major = A^T @ x in col-major with CUBLAS_OP_T
     cublasSgemv(g_cublas_handle,
-                CUBLAS_OP_T,  // Transpose because row-major → col-major
+                CUBLAS_OP_T,  // Transpose because row-major -> col-major
                 cols, rows,   // Transposed dimensions
                 &alpha,
                 A, cols,      // lda = cols (row stride in col-major view)
@@ -63,12 +69,13 @@ void gemv_fp32_batched(
     cudaStream_t stream
 ) {
     init_cublas();
-    if (stream) cublasSetStream(g_cublas_handle, stream);
+    // Always set stream (see gemv_fp32 comment above)
+    cublasSetStream(g_cublas_handle, stream);
 
     float alpha = 1.0f, beta = 0.0f;
 
-    // Just call sgemm with N=1 (matrix × vector = matrix × 1-col matrix)
-    // For batch: treat as [rows*batch, cols] @ [cols, 1] → [rows*batch, 1]
+    // Just call sgemm with N=1 (matrix x vector = matrix x 1-col matrix)
+    // For batch: treat as [rows*batch, cols] @ [cols, 1] -> [rows*batch, 1]
     // But that only works if all projections share the same input.
     // Since Q, K, V all take the same hidden state as input, this works!
     cublasSgemv(g_cublas_handle,
@@ -91,6 +98,7 @@ void vector_add(float* y, const float* a, const float* b, int n, cudaStream_t st
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     vector_add_kernel<<<blocks, threads, 0, stream>>>(y, a, b, n);
+    CUDA_CHECK_LAUNCH();
 }
 
 // Copy: dst = src
@@ -103,6 +111,7 @@ void vector_copy(float* dst, const float* src, int n, cudaStream_t stream) {
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     vector_copy_kernel<<<blocks, threads, 0, stream>>>(dst, src, n);
+    CUDA_CHECK_LAUNCH();
 }
 
 } // namespace cuda

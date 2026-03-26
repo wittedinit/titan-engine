@@ -10,6 +10,17 @@
 
 namespace titan {
 
+SpeculativeDecoder::~SpeculativeDecoder() {
+    if (draft_hidden_) cudaFree(draft_hidden_);
+    if (draft_residual_) cudaFree(draft_residual_);
+    if (draft_logits_) cudaFree(draft_logits_);
+    if (target_logits_batch_) cudaFree(target_logits_batch_);
+    if (d_sampled_token_) cudaFree(d_sampled_token_);
+    if (verify_hidden_) cudaFree(verify_hidden_);
+    if (verify_residual_) cudaFree(verify_residual_);
+    if (d_verify_token_) cudaFree(d_verify_token_);
+}
+
 bool SpeculativeDecoder::initialize(ModelArchitecture* target,
                                      MemoryManager& memory,
                                      const RuntimeConfig& runtime,
@@ -26,6 +37,10 @@ bool SpeculativeDecoder::initialize(ModelArchitecture* target,
     cudaMalloc(&draft_residual_, hd * sizeof(float));
     cudaMalloc(&draft_logits_, vocab * sizeof(float));
     cudaMalloc(&target_logits_batch_, (N + 1) * vocab * sizeof(float));
+    cudaMalloc(&d_sampled_token_, sizeof(int));
+    cudaMalloc(&verify_hidden_, hd * sizeof(float));
+    cudaMalloc(&verify_residual_, hd * sizeof(float));
+    cudaMalloc(&d_verify_token_, sizeof(int));
 
     draft_tokens_.reserve(N);
 
@@ -67,7 +82,7 @@ bool SpeculativeDecoder::initialize(ModelArchitecture* target,
 int SpeculativeDecoder::draft_with_model(float* hidden, float* residual,
                                           int position,
                                           const SamplingParams& sampling,
-                                          void* stream) {
+                                          cudaStream_t stream) {
     if (!draft_model_) return 0;
 
     draft_tokens_.clear();
@@ -79,7 +94,6 @@ int SpeculativeDecoder::draft_with_model(float* hidden, float* residual,
     cudaMemcpy(draft_hidden_, hidden, hd * sizeof(float), cudaMemcpyDeviceToDevice);
     cudaMemcpy(draft_residual_, residual, hd * sizeof(float), cudaMemcpyDeviceToDevice);
 
-    auto* draft_dense = dynamic_cast<DenseExecutor*>(draft_model_.get());
     uint64_t rng = position * 6364136223846793005ULL + 1;
 
     for (int i = 0; i < N; i++) {
@@ -92,19 +106,18 @@ int SpeculativeDecoder::draft_with_model(float* hidden, float* residual,
         // Get logits and sample
         draft_model_->compute_logits(draft_hidden_, draft_logits_, stream);
 
-        int token;
-        cuda::sample_token(draft_logits_, &token, vocab,
+        cuda::sample_token(draft_logits_, d_sampled_token_, vocab,
                           sampling.temperature, sampling.top_p, sampling.top_k,
-                          rng++, (cudaStream_t)stream);
+                          rng++, stream);
 
         // Copy token to CPU
         int h_token;
-        cudaMemcpy(&h_token, &token, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&h_token, d_sampled_token_, sizeof(int), cudaMemcpyDeviceToHost);
         draft_tokens_.push_back(h_token);
 
-        // Embed for next step
-        if (draft_dense && i < N - 1) {
-            draft_dense->embed_token(h_token, draft_hidden_);
+        // Embed for next step (uses virtual method on ModelArchitecture)
+        if (i < N - 1) {
+            draft_model_->embed_token(h_token, draft_hidden_);
             cudaMemcpy(draft_residual_, draft_hidden_, hd * sizeof(float),
                         cudaMemcpyDeviceToDevice);
         }
@@ -117,7 +130,7 @@ int SpeculativeDecoder::draft_with_model(float* hidden, float* residual,
 int SpeculativeDecoder::draft_self_speculative(float* hidden, float* residual,
                                                 int position,
                                                 const SamplingParams& sampling,
-                                                void* stream) {
+                                                cudaStream_t stream) {
     // Self-speculative: run the same model with fewer experts
     // This is a simplified version — full implementation would modify
     // the MoE executor's experts_per_tok on the fly
@@ -141,13 +154,12 @@ int SpeculativeDecoder::draft_self_speculative(float* hidden, float* residual,
 
         target_->compute_logits(draft_hidden_, draft_logits_, stream);
 
-        int token;
-        cuda::sample_token(draft_logits_, &token, vocab,
+        cuda::sample_token(draft_logits_, d_sampled_token_, vocab,
                           sampling.temperature, sampling.top_p, sampling.top_k,
-                          rng++, (cudaStream_t)stream);
+                          rng++, stream);
 
         int h_token;
-        cudaMemcpy(&h_token, &token, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&h_token, d_sampled_token_, sizeof(int), cudaMemcpyDeviceToHost);
         draft_tokens_.push_back(h_token);
     }
 
@@ -214,7 +226,7 @@ int SpeculativeDecoder::generate_step(
     float* hidden, float* residual, float* logits,
     int position, const SamplingParams& sampling,
     const Tokenizer& tokenizer, TokenCallback on_token,
-    void* cuda_stream
+    cudaStream_t cuda_stream
 ) {
     stats_.total_steps++;
     int N = config_.num_draft_tokens;
@@ -241,19 +253,15 @@ int SpeculativeDecoder::generate_step(
     // Step 2: Run target model on all draft positions in batch
     // (In production, this would be a batched forward pass)
     // For now, run sequentially and collect logits
-    float* h_copy = nullptr;
-    float* r_copy = nullptr;
+    float* h_copy = verify_hidden_;
+    float* r_copy = verify_residual_;
     uint32_t hd = target_->config().hidden_dim;
-    cudaMalloc(&h_copy, hd * sizeof(float));
-    cudaMalloc(&r_copy, hd * sizeof(float));
     cudaMemcpy(h_copy, hidden, hd * sizeof(float), cudaMemcpyDeviceToDevice);
     cudaMemcpy(r_copy, residual, hd * sizeof(float), cudaMemcpyDeviceToDevice);
 
-    auto* dense_target = dynamic_cast<DenseExecutor*>(target_);
-
     for (int i = 0; i < num_drafted; i++) {
-        if (i > 0 && dense_target) {
-            dense_target->embed_token(draft_tokens_[i - 1], h_copy);
+        if (i > 0) {
+            target_->embed_token(draft_tokens_[i - 1], h_copy);
             cudaMemcpy(r_copy, h_copy, hd * sizeof(float), cudaMemcpyDeviceToDevice);
         }
 
@@ -280,16 +288,13 @@ int SpeculativeDecoder::generate_step(
     }
 
     // Step 5: Sample one new token from target at the rejection point
+    int new_token = -1;
     if (accepted < num_drafted) {
         // Sample from target logits at the rejected position
-        int new_token;
-        int* d_token;
-        cudaMalloc(&d_token, sizeof(int));
-        cuda::sample_token(target_logits_batch_ + accepted * vocab, d_token,
+        cuda::sample_token(target_logits_batch_ + accepted * vocab, d_verify_token_,
                           vocab, sampling.temperature, sampling.top_p,
                           sampling.top_k, rng, (cudaStream_t)cuda_stream);
-        cudaMemcpy(&new_token, d_token, sizeof(int), cudaMemcpyDeviceToHost);
-        cudaFree(d_token);
+        cudaMemcpy(&new_token, d_verify_token_, sizeof(int), cudaMemcpyDeviceToHost);
 
         if (on_token) {
             std::string text = tokenizer.decode(new_token);
@@ -300,16 +305,15 @@ int SpeculativeDecoder::generate_step(
 
     // Update hidden/residual to reflect accepted state
     // (The target model's KV cache already has the correct entries)
-    if (dense_target && output_count > 0) {
+    if (output_count > 0) {
+        // Bug #6 fix: After rejection, use the newly sampled token (new_token),
+        // not the rejected draft token (draft_tokens_[accepted]).
         int last_token = (accepted < num_drafted)
-            ? draft_tokens_[accepted] // Rejected token was replaced
+            ? new_token                 // Use the resampled token, not the rejected draft
             : draft_tokens_.back();
-        dense_target->embed_token(last_token, hidden);
+        target_->embed_token(last_token, hidden);
         cudaMemcpy(residual, hidden, hd * sizeof(float), cudaMemcpyDeviceToDevice);
     }
-
-    cudaFree(h_copy);
-    cudaFree(r_copy);
 
     LOG_DEBUG("Speculative step: drafted=%d accepted=%d output=%d (rate=%.0f%%)",
               num_drafted, accepted, output_count,

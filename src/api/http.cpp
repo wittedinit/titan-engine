@@ -5,6 +5,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <csignal>
 #include <cstring>
 #include <sstream>
 #include <algorithm>
@@ -119,8 +120,16 @@ std::string HttpResponse::serialize() const {
 bool SseWriter::send_event(const std::string& data) {
     if (fd_ < 0) return false;
     std::string event = "data: " + data + "\n\n";
-    ssize_t n = write(fd_, event.c_str(), event.size());
-    return n == (ssize_t)event.size();
+    size_t sent = 0;
+    while (sent < event.size()) {
+        ssize_t n = write(fd_, event.c_str() + sent, event.size() - sent);
+        if (n <= 0) {
+            fd_ = -1;
+            return false;
+        }
+        sent += n;
+    }
+    return true;
 }
 
 void SseWriter::finish() {
@@ -148,6 +157,10 @@ void HttpServer::post(const std::string& path, RouteHandler handler) {
 
 void HttpServer::post_stream(const std::string& path, StreamHandler handler) {
     routes_.push_back({"POST", path, nullptr, handler, true});
+}
+
+void HttpServer::post_with_stream(const std::string& path, RouteHandler handler, StreamHandler stream_handler) {
+    routes_.push_back({"POST", path, handler, stream_handler, true});
 }
 
 HttpRequest HttpServer::parse_request(int client_fd) {
@@ -312,6 +325,10 @@ void HttpServer::handle_client(int client_fd) {
 }
 
 bool HttpServer::listen(const std::string& host, int port, int num_threads) {
+    // Ignore SIGPIPE so writing to a closed socket returns EPIPE instead of
+    // killing the server process.
+    signal(SIGPIPE, SIG_IGN);
+
     server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd_ < 0) {
         LOG_ERROR("Failed to create socket");

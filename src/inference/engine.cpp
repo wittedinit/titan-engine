@@ -13,6 +13,13 @@
 
 namespace titan {
 
+InferenceEngine::~InferenceEngine() {
+    if (hidden_) cudaFree(hidden_);
+    if (residual_) cudaFree(residual_);
+    if (logits_) cudaFree(logits_);
+    if (sampled_token_gpu_) cudaFree(sampled_token_gpu_);
+}
+
 bool InferenceEngine::initialize(const RuntimeConfig& config) {
     config_ = config;
 
@@ -99,10 +106,38 @@ bool InferenceEngine::load_model(const std::string& model_path) {
     // Generate execution plan
     plan_ = plan_execution(model_->config(), hw_, config_);
 
+    // Pre-allocate inference buffers on GPU (never allocate during generation)
+    const auto& mc = model_->config();
+    size_t hidden_bytes = mc.hidden_dim * sizeof(float);
+    size_t logits_bytes = mc.vocab_size * sizeof(float);
+
+    cudaMalloc(&hidden_, hidden_bytes);
+    cudaMalloc(&residual_, hidden_bytes);
+    cudaMalloc(&logits_, logits_bytes);
+    cudaMalloc(&sampled_token_gpu_, sizeof(int));
+
+    if (!hidden_ || !residual_ || !logits_ || !sampled_token_gpu_) {
+        LOG_ERROR("Failed to allocate pre-allocated inference buffers");
+        return false;
+    }
+
+    // Initialize the executor's KV cache so attention layers can use it
+    auto* dense = dynamic_cast<DenseExecutor*>(model_.get());
+    auto* moe = dynamic_cast<MoEExecutor*>(model_.get());
+    if (dense) {
+        dense->kv_cache().initialize(
+            mc.num_layers, mc.num_kv_heads, mc.head_dim,
+            config_.max_context_len);
+    } else if (moe) {
+        moe->kv_cache().initialize(
+            mc.num_layers, mc.num_kv_heads, mc.head_dim,
+            config_.max_context_len);
+    }
+
     LOG_INFO("Model loaded: %s (%.1fB params, %.1fB active/token)",
-             model_->config().name.c_str(),
-             model_->config().total_params() / 1e9,
-             model_->config().active_params_per_token() / 1e9);
+             mc.name.c_str(),
+             mc.total_params() / 1e9,
+             mc.active_params_per_token() / 1e9);
     LOG_INFO("Execution plan: VRAM=%.1f GB, RAM=%.1f GB",
              plan_.vram_used / 1e9, plan_.ram_used / 1e9);
 
@@ -123,42 +158,22 @@ void InferenceEngine::generate(const std::string& prompt,
     auto prompt_tokens = tokenizer_.encode(prompt, true);
     LOG_INFO("Prompt: %zu tokens", prompt_tokens.size());
 
-    // Allocate buffers on GPU
-    float* hidden = nullptr;
-    float* residual = nullptr;
-    float* logits = nullptr;
-    int* sampled_token_gpu = nullptr;
+    // Use pre-allocated GPU buffers (allocated once during load_model)
+    float* hidden = hidden_;
+    float* residual = residual_;
+    float* logits = logits_;
+    int* sampled_token_gpu = sampled_token_gpu_;
 
     size_t hidden_bytes = cfg.hidden_dim * sizeof(float);
-    size_t logits_bytes = cfg.vocab_size * sizeof(float);
-
-    cudaMalloc(&hidden, hidden_bytes);
-    cudaMalloc(&residual, hidden_bytes);
-    cudaMalloc(&logits, logits_bytes);
-    cudaMalloc(&sampled_token_gpu, sizeof(int));
-
-    if (!hidden || !residual || !logits || !sampled_token_gpu) {
-        LOG_ERROR("Failed to allocate inference buffers");
-        return;
-    }
 
     cudaMemset(residual, 0, hidden_bytes);
 
     auto t_start = std::chrono::steady_clock::now();
 
-    // Get executor for embedding access (works for both Dense and MoE)
-    auto* dense = dynamic_cast<DenseExecutor*>(model_.get());
-    auto* moe = dynamic_cast<MoEExecutor*>(model_.get());
-
-    auto do_embed = [&](int token_id, float* buf) {
-        if (dense) dense->embed_token(token_id, buf);
-        else if (moe) moe->embed_token(token_id, buf);
-    };
-
     // --- Prefill Phase: Process prompt tokens ---
     for (size_t i = 0; i < prompt_tokens.size(); i++) {
-        // Embedding lookup
-        do_embed(prompt_tokens[i], hidden);
+        // Embedding lookup (uses virtual method on ModelArchitecture)
+        model_->embed_token(prompt_tokens[i], hidden);
 
         // Copy to residual stream
         cudaMemcpy(residual, hidden, hidden_bytes, cudaMemcpyDeviceToDevice);
@@ -217,8 +232,8 @@ void InferenceEngine::generate(const std::string& prompt,
             on_token(token_id, text);
         }
 
-        // Embed the new token for next step
-        do_embed(token_id, hidden);
+        // Embed the new token for next step (uses virtual method)
+        model_->embed_token(token_id, hidden);
         cudaMemcpy(residual, hidden, hidden_bytes, cudaMemcpyDeviceToDevice);
 
         // Forward through all layers
@@ -242,12 +257,6 @@ void InferenceEngine::generate(const std::string& prompt,
     LOG_INFO("Generated %d tokens in %.1f s (%.1f tok/s)",
              tokens_generated, decode_s,
              tokens_generated > 0 ? tokens_generated / decode_s : 0);
-
-    // Cleanup
-    cudaFree(hidden);
-    cudaFree(residual);
-    cudaFree(logits);
-    cudaFree(sampled_token_gpu);
 }
 
 void InferenceEngine::print_stats() const {

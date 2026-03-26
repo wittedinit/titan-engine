@@ -27,10 +27,10 @@ public:
 
     void forward_layer(float* hidden, float* residual,
                        uint32_t layer_id, int position,
-                       void* cuda_stream) override;
+                       cudaStream_t cuda_stream) override;
 
     void compute_logits(const float* hidden, float* logits,
-                        void* cuda_stream) override;
+                        cudaStream_t cuda_stream) override;
 
     size_t attention_weight_bytes(uint32_t layer_id) const override;
     size_t ffn_weight_bytes(uint32_t layer_id) const override;
@@ -40,7 +40,7 @@ public:
     void update_kv_cache(uint32_t layer_id, int position,
                          const float* key, const float* value) override;
 
-    void embed_token(int token_id, float* output, cudaStream_t stream = nullptr);
+    void embed_token(int token_id, float* output, cudaStream_t stream = nullptr) override;
     KVCache& kv_cache() { return kv_cache_; }
 
 private:

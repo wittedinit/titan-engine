@@ -26,7 +26,12 @@ void Tokenizer::init_byte_encoding() {
             byte_to_token_[b] = std::string(1, (char)b);
         } else {
             // Map to unicode range starting at 256
-            byte_to_token_[b] = std::string(1, (char)(256 + n));
+            // Values 256-511 need proper UTF-8 encoding (2 bytes)
+            unsigned int codepoint = 256 + n;
+            std::string s;
+            s += (char)(0xC0 | (codepoint >> 6));
+            s += (char)(0x80 | (codepoint & 0x3F));
+            byte_to_token_[b] = s;
             n++;
         }
     }

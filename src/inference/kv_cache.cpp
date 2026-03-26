@@ -18,6 +18,10 @@ bool KVCache::initialize(uint32_t num_layers, uint32_t num_kv_heads,
     head_dim_ = head_dim;
     max_seq_len_ = max_seq_len;
     seq_len_ = 0;
+    // Bug #10: Store the requested dtype for future FP16 KV cache support.
+    // Currently always allocates float* (FP32). When FP16 support is added,
+    // total_bytes calculation and update() memcpy sizes should use dtype_size().
+    dtype_ = dtype;
 
     layer_stride_ = (size_t)max_seq_len * num_kv_heads * head_dim;
     size_t total_elements = (size_t)num_layers * layer_stride_;
@@ -64,6 +68,7 @@ void KVCache::update(uint32_t layer, int position,
                       const float* key, const float* value,
                       cudaStream_t stream) {
     if (!k_data_ || !v_data_) return;
+    if (position < 0) return;  // Bug #11: Guard against negative position
     if (layer >= num_layers_ || position >= (int)max_seq_len_) return;
 
     size_t kv_size = (size_t)num_kv_heads_ * head_dim_;

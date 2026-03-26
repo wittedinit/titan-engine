@@ -50,7 +50,6 @@ def run_titan(model_path, quant="q4_k", max_tokens=100, prompt="Once upon a time
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        timeout=300
     )
 
     stdout, stderr = proc.communicate(input=prompt + "\nexit\n", timeout=300)

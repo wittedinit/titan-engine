@@ -8,9 +8,6 @@
 
 namespace titan {
 
-// Track allocations for proper cleanup
-static std::unordered_map<void*, size_t> s_alloc_sizes;
-static std::unordered_map<void*, bool> s_is_pinned;
 
 RamPool::RamPool(size_t budget_bytes)
     : capacity_(budget_bytes) {
@@ -42,8 +39,8 @@ void* RamPool::allocate(size_t bytes) {
     }
 
     used_ += aligned_bytes;
-    s_alloc_sizes[ptr] = aligned_bytes;
-    s_is_pinned[ptr] = false;
+    alloc_sizes_[ptr] = aligned_bytes;
+    is_pinned_[ptr] = false;
     return ptr;
 }
 
@@ -51,20 +48,20 @@ void RamPool::free(void* ptr) {
     if (!ptr) return;
     std::lock_guard<std::mutex> lock(mutex_);
 
-    auto it = s_alloc_sizes.find(ptr);
-    if (it == s_alloc_sizes.end()) {
+    auto it = alloc_sizes_.find(ptr);
+    if (it == alloc_sizes_.end()) {
         LOG_WARN("RAM pool: free() called with unknown pointer %p", ptr);
         return;
     }
 
     // Unpin if pinned
-    if (s_is_pinned[ptr]) {
+    if (is_pinned_[ptr]) {
         cudaHostUnregister(ptr);
     }
 
     used_ -= it->second;
-    s_alloc_sizes.erase(it);
-    s_is_pinned.erase(ptr);
+    alloc_sizes_.erase(it);
+    is_pinned_.erase(ptr);
     ::free(ptr);
 }
 
@@ -84,8 +81,8 @@ void* RamPool::allocate_pinned(size_t bytes) {
     }
 
     used_ += bytes;
-    s_alloc_sizes[ptr] = bytes;
-    s_is_pinned[ptr] = true;
+    alloc_sizes_[ptr] = bytes;
+    is_pinned_[ptr] = true;
     return ptr;
 }
 
@@ -93,11 +90,11 @@ void RamPool::free_pinned(void* ptr) {
     if (!ptr) return;
     std::lock_guard<std::mutex> lock(mutex_);
 
-    auto it = s_alloc_sizes.find(ptr);
-    if (it != s_alloc_sizes.end()) {
+    auto it = alloc_sizes_.find(ptr);
+    if (it != alloc_sizes_.end()) {
         used_ -= it->second;
-        s_alloc_sizes.erase(it);
-        s_is_pinned.erase(ptr);
+        alloc_sizes_.erase(it);
+        is_pinned_.erase(ptr);
     }
     cudaFreeHost(ptr);
 }

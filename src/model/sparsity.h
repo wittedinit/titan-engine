@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/types.h"
+#include <cuda_runtime.h>
 #include <vector>
 #include <string>
 #include <unordered_set>
@@ -164,7 +165,7 @@ public:
         uint32_t layer_id,
         DType weight_dtype,
         int group_size,
-        void* cuda_stream
+        cudaStream_t cuda_stream
     );
 
     // Get sparsity stats for the last forward pass

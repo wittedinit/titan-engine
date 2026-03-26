@@ -258,9 +258,11 @@ int run_server(InferenceEngine& engine, const std::string& model_name,
     server.get("/v1/models", handle_models);
     server.get("/health", handle_health);
 
-    // Chat completions: supports both streaming and non-streaming
-    server.post("/v1/chat/completions", handle_chat_non_stream);
-    server.post_stream("/v1/chat/completions", handle_chat_stream);
+    // Chat completions: register both handlers on a single route so non-streaming
+    // and streaming requests are both reachable. Previously, post() and post_stream()
+    // created two separate Route entries for the same path, and the route matching loop
+    // always took the first (non-streaming) match, making the stream handler dead code.
+    server.post_with_stream("/v1/chat/completions", handle_chat_non_stream, handle_chat_stream);
 
     // Text completions (simplified — maps to same handler)
     server.post("/v1/completions", [](const HttpRequest& req) -> HttpResponse {

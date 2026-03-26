@@ -1,3 +1,4 @@
+#include "cuda_check.h"
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cmath>
@@ -173,12 +174,14 @@ void swiglu(float* output, const float* gate, const float* up,
     int threads = 256;
     int blocks = (dim + threads - 1) / threads;
     swiglu_kernel<<<blocks, threads, 0, stream>>>(output, gate, up, dim);
+    CUDA_CHECK_LAUNCH();
 }
 
 void gelu(float* output, const float* input, int dim, cudaStream_t stream) {
     int threads = 256;
     int blocks = (dim + threads - 1) / threads;
     gelu_kernel<<<blocks, threads, 0, stream>>>(output, input, dim);
+    CUDA_CHECK_LAUNCH();
 }
 
 void fused_add_rmsnorm(float* output, float* residual, const float* hidden,
@@ -189,6 +192,7 @@ void fused_add_rmsnorm(float* output, float* residual, const float* hidden,
     fused_add_rmsnorm_kernel<<<1, threads, shared_mem, stream>>>(
         output, residual, hidden, weight, dim, eps
     );
+    CUDA_CHECK_LAUNCH();
 }
 
 void fused_moe_combine_norm(
@@ -205,6 +209,7 @@ void fused_moe_combine_norm(
         shared_expert, shared_weight, norm_weight,
         dim, num_active, eps
     );
+    CUDA_CHECK_LAUNCH();
 }
 
 } // namespace cuda

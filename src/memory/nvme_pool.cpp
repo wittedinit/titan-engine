@@ -178,9 +178,9 @@ ssize_t NvmePool::read_file(const std::string& path, void* dst, size_t bytes,
     auto t1 = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(t1 - t0).count();
     if (elapsed > 0) {
-        last_bandwidth_ = (float)(total_read / elapsed / 1e9);
+        last_bandwidth_.store((float)(total_read / elapsed / 1e9), std::memory_order_relaxed);
     }
-    total_read_ += total_read;
+    total_read_.fetch_add(total_read, std::memory_order_relaxed);
 
     return total_read;
 }
@@ -220,7 +220,7 @@ void NvmePool::async_read_file(const std::string& path, void* dst, size_t bytes,
         io_uring_cqe_seen(&io_ctx_->ring, cqe);
         close(fd);
 
-        total_read_ += (result > 0 ? result : 0);
+        total_read_.fetch_add(result > 0 ? result : 0, std::memory_order_relaxed);
         if (callback) callback(result);
         return;
     }
@@ -233,7 +233,7 @@ void NvmePool::async_read_file(const std::string& path, void* dst, size_t bytes,
     task.bytes = bytes;
     task.offset = offset;
     task.callback = [this, callback](ssize_t n) {
-        total_read_ += (n > 0 ? n : 0);
+        total_read_.fetch_add(n > 0 ? n : 0, std::memory_order_relaxed);
         if (callback) callback(n);
     };
 

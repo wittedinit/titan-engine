@@ -60,7 +60,7 @@ struct SpeculativeConfig {
 class SpeculativeDecoder {
 public:
     SpeculativeDecoder() = default;
-    ~SpeculativeDecoder() = default;
+    ~SpeculativeDecoder();
 
     // Initialize with target model and speculative config
     bool initialize(ModelArchitecture* target_model,
@@ -80,7 +80,7 @@ public:
         const SamplingParams& sampling,
         const Tokenizer& tokenizer,
         TokenCallback on_token,
-        void* cuda_stream = nullptr
+        cudaStream_t cuda_stream = nullptr
     );
 
     // Stats
@@ -117,6 +117,14 @@ private:
     float* draft_logits_ = nullptr;
     float* target_logits_batch_ = nullptr; // [num_draft+1, vocab_size]
 
+    // Pre-allocated GPU buffer for sampling output (avoids host pointer to GPU kernel)
+    int* d_sampled_token_ = nullptr;
+
+    // Pre-allocated buffers for generate_step (avoids per-step cudaMalloc)
+    float* verify_hidden_ = nullptr;     // [hidden_dim] copy for target verification
+    float* verify_residual_ = nullptr;   // [hidden_dim] copy for target verification
+    int* d_verify_token_ = nullptr;      // GPU int for sampling at rejection point
+
     // Verification
     int verify_and_accept(const float* target_logits_batch,
                           const std::vector<int>& draft_tokens,
@@ -126,9 +134,9 @@ private:
 
     // Draft model methods
     int draft_with_model(float* hidden, float* residual, int position,
-                         const SamplingParams& sampling, void* stream);
+                         const SamplingParams& sampling, cudaStream_t stream);
     int draft_self_speculative(float* hidden, float* residual, int position,
-                               const SamplingParams& sampling, void* stream);
+                               const SamplingParams& sampling, cudaStream_t stream);
 };
 
 } // namespace titan

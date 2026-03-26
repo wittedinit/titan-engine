@@ -20,7 +20,7 @@ namespace titan {
 class InferenceEngine {
 public:
     InferenceEngine() = default;
-    ~InferenceEngine() = default;
+    ~InferenceEngine();
 
     // Initialize: detect hardware, load model, set up memory
     bool initialize(const RuntimeConfig& config);
@@ -50,6 +50,12 @@ private:
     Tokenizer tokenizer_;
     ExecutionPlan plan_;
     bool initialized_ = false;
+
+    // Pre-allocated GPU inference buffers (allocated once during load_model)
+    float* hidden_ = nullptr;           // [hidden_dim]
+    float* residual_ = nullptr;         // [hidden_dim]
+    float* logits_ = nullptr;           // [vocab_size]
+    int* sampled_token_gpu_ = nullptr;  // Single int on GPU for sampling output
 };
 
 } // namespace titan

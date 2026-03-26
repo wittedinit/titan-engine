@@ -114,7 +114,7 @@ void MemoryManager::migrate(Tensor& tensor, MemoryTier target) {
         if (target == MemoryTier::VRAM) {
             vram_->copy_from(new_data, tensor.data, bytes, tensor.desc.tier);
         } else if (target == MemoryTier::RAM && tensor.desc.tier == MemoryTier::VRAM) {
-            vram_->copy_to(tensor.data, new_data, bytes, MemoryTier::RAM);
+            vram_->copy_to(new_data, tensor.data, bytes, MemoryTier::RAM);
         }
     }
 

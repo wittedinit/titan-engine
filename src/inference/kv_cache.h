@@ -59,6 +59,7 @@ private:
     uint32_t    max_seq_len_ = 0;
     int         seq_len_ = 0;
     size_t      layer_stride_ = 0;  // Elements per layer
+    DType       dtype_ = DType::FP32; // Stored for future FP16 KV cache support
 };
 
 } // namespace titan

@@ -1,6 +1,8 @@
 #pragma once
 
 #include "core/types.h"
+#include <cuda_runtime.h>
+#include <cstdint>
 
 namespace titan {
 
@@ -25,35 +27,89 @@ enum class ComputeDevice {
 
 // Forward declarations for GPU kernels
 namespace cuda {
+
+    // --- dequant.cu ---
     void dequant_matvec_int4(const void* weights, const void* scales, const void* biases,
                              const float* input, float* output,
-                             int rows, int cols, int group_size, void* stream);
+                             int rows, int cols, int group_size, cudaStream_t stream);
     void dequant_matvec_int2(const void* weights, const void* scales, const void* biases,
                              const float* input, float* output,
-                             int rows, int cols, int group_size, void* stream);
+                             int rows, int cols, int group_size, cudaStream_t stream);
+
+    // --- norm.cu ---
     void rmsnorm(float* output, const float* input, const float* weight,
-                 int dim, float eps, void* stream);
+                 int dim, float eps, cudaStream_t stream);
+    void layernorm(float* output, const float* input,
+                   const float* weight, const float* bias,
+                   int dim, float eps, cudaStream_t stream);
+
+    // --- activation.cu ---
     void swiglu(float* output, const float* gate, const float* up,
-                int dim, void* stream);
-    void apply_rope(float* q, float* k, int num_heads, int num_kv_heads, int head_dim,
-                    int position, float theta, float scaling, void* stream);
-    void attention_decode(const float* q, const float* k_cache, const float* v_cache,
-                          float* output, int num_heads, int num_kv_heads,
-                          int head_dim, int seq_len, void* stream);
-    void moe_gate(const float* hidden, const float* gate_weight, float* logits,
-                  int hidden_dim, int num_experts, void* stream);
-    void moe_topk(const float* logits, float* weights, int* indices,
-                  int num_experts, int k, void* stream);
+                int dim, cudaStream_t stream);
+    void gelu(float* output, const float* input, int dim, cudaStream_t stream);
     void fused_add_rmsnorm(float* output, float* residual, const float* hidden,
-                            const float* weight, int dim, float eps, void* stream);
+                            const float* weight, int dim, float eps,
+                            cudaStream_t stream);
     void fused_moe_combine_norm(float* output, float* residual,
                                  const float* expert_outputs, const float* routing_weights,
                                  const float* shared_expert, float shared_weight,
                                  const float* norm_weight,
-                                 int dim, int num_active, float eps, void* stream);
+                                 int dim, int num_active, float eps, cudaStream_t stream);
+
+    // --- attention.cu ---
+    void apply_rope(float* q, float* k, int num_heads, int num_kv_heads, int head_dim,
+                    int position, float theta, float scaling, cudaStream_t stream);
+    void attention_decode(const float* q, const float* k_cache, const float* v_cache,
+                          float* output, int num_heads, int num_kv_heads,
+                          int head_dim, int seq_len, cudaStream_t stream);
+
+    // --- moe.cu ---
+    void moe_gate(const float* hidden, const float* gate_weight, float* logits,
+                  int hidden_dim, int num_experts, cudaStream_t stream);
+    void moe_topk(const float* logits, float* weights, int* indices,
+                  int num_experts, int k, cudaStream_t stream);
+
+    // --- sampling.cu ---
     void sample_token(const float* logits, int* output_token,
                       int vocab_size, float temperature, float top_p, int top_k,
-                      uint64_t seed, void* stream);
+                      uint64_t seed, cudaStream_t stream);
+
+    // --- gemv.cu ---
+    void init_cublas();
+    void destroy_cublas();
+    void gemv_fp32(const float* A, const float* x, float* y,
+                   int rows, int cols, cudaStream_t stream);
+    void gemv_fp32_batched(const float* A, const float* x, float* y,
+                           int rows, int cols, int batch, cudaStream_t stream);
+    void vector_add(float* y, const float* a, const float* b, int n, cudaStream_t stream);
+    void vector_copy(float* dst, const float* src, int n, cudaStream_t stream);
+
+    // --- fp4.cu ---
+    void dequant_matvec_fp4(const void* weights, const void* scales,
+                            const float* input, float* output,
+                            int rows, int cols, int group_size, cudaStream_t stream);
+    void quantize_fp4(const float* input, void* output, void* scales,
+                      int numel, int group_size, cudaStream_t stream);
+
+    // --- sparse.cu ---
+    void profile_activations(const float* activations, float* magnitude_sum, int* nonzero_count,
+                             int inter_dim, int batch_tokens, float threshold, cudaStream_t stream);
+    void predict_active_neurons(const float* hidden, const float* pred_weight, const float* pred_bias,
+                                int* active_indices, int* num_active,
+                                int hidden_dim, int inter_dim, int max_active, float threshold,
+                                cudaStream_t stream);
+    void sparse_matvec(const float* weight, const float* input, float* output,
+                       const int* active_indices, int num_active, int cols,
+                       cudaStream_t stream);
+    void sparse_dequant_matvec_int4(const void* weights, const void* scales, const void* biases,
+                                    const float* input, float* output,
+                                    const int* active_indices, int num_active, int cols, int group_size,
+                                    cudaStream_t stream);
+    void sparse_swiglu(float* output, const float* gate, const float* up,
+                       const int* active_indices, int num_active, cudaStream_t stream);
+    void sparse_down_proj(const float* sparse_activation, const float* down_weight, float* output,
+                          const int* active_indices, int num_active,
+                          int hidden_dim, int inter_dim, cudaStream_t stream);
 }
 
 // Forward declarations for CPU kernels

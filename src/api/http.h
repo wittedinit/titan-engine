@@ -80,6 +80,10 @@ public:
     // Register streaming handler (for SSE endpoints like chat completions)
     void post_stream(const std::string& path, StreamHandler handler);
 
+    // Register both non-streaming and streaming handlers on the same route.
+    // The dispatcher checks req.json_bool("stream") to pick the right handler.
+    void post_with_stream(const std::string& path, RouteHandler handler, StreamHandler stream_handler);
+
     // Start serving (blocking)
     bool listen(const std::string& host, int port, int num_threads = 4);
 

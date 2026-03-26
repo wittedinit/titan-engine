@@ -129,6 +129,7 @@ private:
     float* batch_hidden_ = nullptr;     // [max_batch, hidden_dim]
     float* batch_residual_ = nullptr;
     float* batch_logits_ = nullptr;     // [max_batch, vocab_size]
+    int* batch_sampled_tokens_ = nullptr; // [max_batch] pre-allocated GPU token output slots
 
     // Scheduling
     int allocate_slot();

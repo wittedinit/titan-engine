@@ -2,6 +2,7 @@
 
 #include "core/types.h"
 #include "core/hardware.h"
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <list>
@@ -101,6 +102,11 @@ private:
     size_t      capacity_;
     size_t      used_ = 0;
     std::mutex  mutex_;
+
+    // Per-instance allocation tracking (not file-scoped statics, which would be
+    // shared across multiple RamPool instances).
+    std::unordered_map<void*, size_t> alloc_sizes_;
+    std::unordered_map<void*, bool>   is_pinned_;
 };
 
 // ============================================================================
@@ -145,15 +151,15 @@ public:
                     ReadCallback on_all_complete);
 
     // Telemetry
-    float last_read_bandwidth() const { return last_bandwidth_; }
-    size_t total_bytes_read() const { return total_read_; }
+    float last_read_bandwidth() const { return last_bandwidth_.load(std::memory_order_relaxed); }
+    size_t total_bytes_read() const { return total_read_.load(std::memory_order_relaxed); }
 
 private:
     std::string base_path_;
     size_t      capacity_ = 0;
     size_t      used_ = 0;
-    float       last_bandwidth_ = 0;
-    size_t      total_read_ = 0;
+    std::atomic<float>  last_bandwidth_{0};
+    std::atomic<size_t> total_read_{0};
 
     // io_uring or thread pool for async I/O
     struct IoContext;

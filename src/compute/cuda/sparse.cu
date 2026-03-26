@@ -1,3 +1,4 @@
+#include "cuda_check.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
@@ -283,6 +284,7 @@ void profile_activations(
         activations, magnitude_sum, nonzero_count,
         inter_dim, batch_tokens, threshold
     );
+    CUDA_CHECK_LAUNCH();
 }
 
 void predict_active_neurons(
@@ -300,6 +302,7 @@ void predict_active_neurons(
         hidden, pred_weight, pred_bias, active_indices, num_active,
         hidden_dim, inter_dim, max_active, threshold
     );
+    CUDA_CHECK_LAUNCH();
 }
 
 void sparse_matvec(
@@ -312,6 +315,7 @@ void sparse_matvec(
     sparse_matvec_fp32_kernel<<<num_active, threads, shared_mem, stream>>>(
         weight, input, output, active_indices, num_active, cols
     );
+    CUDA_CHECK_LAUNCH();
 }
 
 void sparse_dequant_matvec_int4(
@@ -326,6 +330,7 @@ void sparse_dequant_matvec_int4(
         (const uint32_t*)weights, (const half*)scales, (const half*)biases,
         input, output, active_indices, num_active, cols, group_size
     );
+    CUDA_CHECK_LAUNCH();
 }
 
 void sparse_swiglu(
@@ -337,6 +342,7 @@ void sparse_swiglu(
     sparse_swiglu_kernel<<<blocks, threads, 0, stream>>>(
         output, gate, up, active_indices, num_active
     );
+    CUDA_CHECK_LAUNCH();
 }
 
 void sparse_down_proj(
@@ -349,6 +355,7 @@ void sparse_down_proj(
         sparse_activation, down_weight, output,
         active_indices, num_active, hidden_dim, inter_dim
     );
+    CUDA_CHECK_LAUNCH();
 }
 
 } // namespace cuda

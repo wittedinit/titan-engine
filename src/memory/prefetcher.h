@@ -107,7 +107,7 @@ private:
     };
     std::vector<PrefetchBuffer> buffers_;
     int num_buffers_ = 0;
-    std::mutex buffer_mutex_;
+    mutable std::mutex buffer_mutex_;
 
     // I/O thread pool
     std::vector<std::thread> io_threads_;
