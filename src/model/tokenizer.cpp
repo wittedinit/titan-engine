@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <regex>
 #include <cstring>
+#include <climits>
 
 namespace titan {
 
