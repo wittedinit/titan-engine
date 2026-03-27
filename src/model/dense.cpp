@@ -2,6 +2,7 @@
 #include "model/loader.h"
 #include "compute/dispatch.h"
 #include "core/logging.h"
+#include "core/config.h"
 
 #include <cuda_runtime.h>
 #include <cstring>
@@ -10,7 +11,7 @@
 
 // Dispatch matvec based on weight format
 static void matvec_dispatch(
-    DType dtype, int group_size,
+    titan::DType dtype, int group_size,
     const void* weight, const void* scales, const void* biases,
     const float* input, float* output,
     int rows, int cols, cudaStream_t stream

@@ -2,6 +2,7 @@
 #include "model/loader.h"
 #include "compute/dispatch.h"
 #include "core/logging.h"
+#include "core/config.h"
 
 #include <cuda_runtime.h>
 #include <cstring>
