@@ -258,9 +258,7 @@ void SparseFfnExecutor::forward(
 
     // Sparse gate and up projections
     // Only compute rows for active neurons
-    namespace cuda = titan::cuda;
-
-    // TODO: Call sparse_dequant_matvec_int4 or sparse_matvec based on weight_dtype
+    // TODO: Call titan::cuda::sparse_dequant_matvec_int4 or sparse_matvec based on weight_dtype
     // For now, this is the connection point — the CUDA kernels are implemented in sparse.cu
 
     // Record stats
