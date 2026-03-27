@@ -122,7 +122,7 @@ Supports HuggingFace safetensors directories, GGUF files, and Titan native forma
 
 - **Language**: C++17 with CUDA kernels, cuBLAS for FP32 matvec
 - **GPU**: NVIDIA CUDA (sm_80 Ampere, sm_89 Ada, sm_100 Blackwell)
-- **Build**: CMake 3.24+, CUDA 12.0+
+- **Build**: CMake 3.24+, CUDA 12.8+ (sm_100 Blackwell requires 12.8+)
 - **I/O**: io_uring for async NVMe reads, pread fallback on macOS/older Linux
 
 ## Key Design Principles

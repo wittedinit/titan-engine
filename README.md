@@ -42,12 +42,10 @@ docker run --gpus all -it --rm \
   -v /path/to/titan-engine:/workspace \
   -v /path/to/models:/models \
   -p 8080:8080 \
-  nvidia/cuda:12.9.0-devel-ubuntu22.04 bash
+  nvidia/cuda:12.8.1-devel-ubuntu22.04 bash
 
 # Inside container:
-apt-get update && apt-get install -y cmake build-essential wget
-wget -qO- https://github.com/Kitware/CMake/releases/download/v3.28.3/cmake-3.28.3-linux-x86_64.tar.gz | tar xz -C /opt
-export PATH=/opt/cmake-3.28.3-linux-x86_64/bin:$PATH
+apt-get update && apt-get install -y cmake build-essential
 cd /workspace && mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=100
 make -j$(nproc)
