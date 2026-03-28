@@ -8,36 +8,49 @@ Titan Engine is a high-performance C++/CUDA LLM inference engine designed for co
 
 ### Prerequisites
 
-- **Linux** (kernel 5.1+ for io_uring, also compiles on macOS for development)
-- **CUDA Toolkit 12.0+** (12.9+ for sm_100 Blackwell / FP4 support)
+- **Linux** (kernel 5.1+ for io_uring; Ubuntu 24.04 tested)
+- **CUDA Toolkit 12.8+** — required for sm_100 Blackwell (RTX 5090). sm_89 Ada (RTX 4090) works with 12.0+.
 - **CMake 3.24+**
 - **GCC 11+** or **Clang 14+**
 - **liburing** (optional — falls back to pread without it)
 
-### Build
+### Build (Ubuntu 24.04 — Native, Recommended)
 
 ```bash
+# 1. Install CUDA 12.8 (skip if already installed — verify with: nvcc --version)
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt-get update
+sudo apt-get install -y cuda-toolkit-12-8 cmake build-essential
+
+# 2. Set PATH (add to ~/.bashrc for persistence)
+export PATH=/usr/local/cuda-12.8/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH
+
+# 3. Clone and build
 git clone https://github.com/wittedinit/titan-engine.git
-cd titan-engine
-mkdir build && cd build
+cd titan-engine && mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=100
 make -j$(nproc)
 ```
+
+> **Ubuntu 24.04 known issue:** If `nvidia-cuda-toolkit` (the Ubuntu system package, version 12.0) is also installed, it will shadow the 12.8 nvcc and cause build failures (`_Float32` errors, `compute_100` unsupported). Fix: `sudo apt-get remove --purge nvidia-cuda-toolkit` then rebuild.
 
 Build options:
 ```bash
 cmake .. \
   -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CUDA_ARCHITECTURES="89;100" \   # 89=Ada, 100=Blackwell
+  -DCMAKE_CUDA_ARCHITECTURES="89;100" \   # 89=Ada (RTX 4090), 100=Blackwell (RTX 5090)
   -DTITAN_USE_IO_URING=ON \               # io_uring for NVMe I/O
   -DTITAN_USE_AVX512=ON \                 # AVX-512 CPU expert execution
   -DTITAN_BUILD_TESTS=ON \                # Build test suite
   -DTITAN_BUILD_PYTHON=ON                 # Python bindings (requires pybind11)
 ```
 
-### Build in Docker (Unraid / headless servers)
+### Build in Docker
 
 ```bash
+# Requires CUDA 12.8 image for sm_100 Blackwell support
 docker run --gpus all -it --rm \
   -v /path/to/titan-engine:/workspace \
   -v /path/to/models:/models \
@@ -373,7 +386,7 @@ titan-engine/
 
 ## Status
 
-**v0.3.0** — All features implemented. Full 6-agent audit complete with 50+ bug fixes.
+**v0.3.1** — Verified build on Ubuntu 24.04 + RTX 5090 (sm_100). All features implemented. Full 6-agent audit + real-hardware build validation complete.
 
 ### Implemented
 - [x] Full forward pass: embedding → N layers → logits → sampling → text output
@@ -401,6 +414,7 @@ titan-engine/
 - [x] NVIDIA FP4 converter (BF16 → NVFP4/MXFP4 via Model Optimizer)
 - [x] Proper VRAM lifecycle (destructors free all model weights, no leaks)
 - [x] Thread-safe cuBLAS init, atomic NVMe stats, mutex-guarded prefetcher
+- [x] Ubuntu 24.04 + GCC 13 build validated (sm_100, CUDA 12.8, AVX-512)
 
 ## Research References
 
