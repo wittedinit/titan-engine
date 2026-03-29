@@ -137,9 +137,25 @@ bool MoEExecutor::initialize(const std::string& model_path,
     uint32_t kv_cache_head_dim = config_.has_mla && config_.nope_head_dim > 0
                                   ? config_.nope_head_dim
                                   : config_.head_dim;
-    if (!kv_cache_.initialize(config_.num_layers, config_.num_kv_heads,
-                               kv_cache_head_dim, runtime.max_context_len))
-        return false;
+
+    // Auto-cap context length: KV cache = 2 × layers × kv_heads × head_dim × ctx × 4 bytes
+    // Must fit within available VRAM (leave 8GB headroom for weights and scratch)
+    {
+        size_t vram_bytes = 0;
+        cudaMemGetInfo(nullptr, &vram_bytes);  // total VRAM
+        size_t kv_headroom = (vram_bytes > (size_t)8 << 30) ? vram_bytes - ((size_t)8 << 30) : (size_t)2 << 30;
+        size_t kv_per_ctx = 2ULL * config_.num_layers * config_.num_kv_heads * kv_cache_head_dim * 4;
+        uint32_t max_ctx_by_vram = kv_per_ctx > 0 ? (uint32_t)(kv_headroom / kv_per_ctx) : runtime.max_context_len;
+        // Round down to power of 2 and clamp
+        uint32_t capped_ctx = std::min(runtime.max_context_len, std::max(512u, max_ctx_by_vram));
+        if (capped_ctx < runtime.max_context_len) {
+            LOG_WARN("KV cache: capping context from %u to %u to fit in VRAM",
+                     runtime.max_context_len, capped_ctx);
+        }
+        if (!kv_cache_.initialize(config_.num_layers, config_.num_kv_heads,
+                                   kv_cache_head_dim, capped_ctx))
+            return false;
+    }
 
     ModelLoader loader;
     if (!loader.load(model_path)) return false;
@@ -223,15 +239,25 @@ bool MoEExecutor::initialize(const std::string& model_path,
         try_load(lp + ".input_layernorm.weight", aw.attn_norm, hd * sizeof(float));
         try_load(lp + ".post_attention_layernorm.weight", aw.ffn_norm, hd * sizeof(float));
 
-        // Attention
-        cudaMalloc(&aw.q_proj, qkv * hd * sizeof(float));
-        cudaMalloc(&aw.k_proj, kv * hd * sizeof(float));
-        cudaMalloc(&aw.v_proj, kv * hd * sizeof(float));
-        cudaMalloc(&aw.o_proj, hd * qkv * sizeof(float));
-        cudaMemset(aw.q_proj, 0, qkv * hd * sizeof(float));
-        cudaMemset(aw.k_proj, 0, kv * hd * sizeof(float));
-        cudaMemset(aw.v_proj, 0, kv * hd * sizeof(float));
-        cudaMemset(aw.o_proj, 0, hd * qkv * sizeof(float));
+        // Attention — MLA models don't use standard q/k/v projections; skip those allocs
+        // to avoid wasting ~400MB × 3 per layer (73 GB for a 61-layer model).
+        if (config_.has_mla) {
+            // o_proj for MLA: [hidden, n_heads * v_head_dim] = [7168, 8192] per layer
+            uint32_t o_in_mla = config_.num_attn_heads * (config_.v_head_dim > 0
+                                  ? config_.v_head_dim : (config_.nope_head_dim > 0
+                                    ? config_.nope_head_dim : config_.head_dim));
+            cudaMalloc(&aw.o_proj, hd * o_in_mla * sizeof(float));
+            cudaMemset(aw.o_proj, 0, hd * o_in_mla * sizeof(float));
+        } else {
+            cudaMalloc(&aw.q_proj, qkv * hd * sizeof(float));
+            cudaMalloc(&aw.k_proj, kv * hd * sizeof(float));
+            cudaMalloc(&aw.v_proj, kv * hd * sizeof(float));
+            cudaMalloc(&aw.o_proj, hd * qkv * sizeof(float));
+            cudaMemset(aw.q_proj, 0, qkv * hd * sizeof(float));
+            cudaMemset(aw.k_proj, 0, kv * hd * sizeof(float));
+            cudaMemset(aw.v_proj, 0, kv * hd * sizeof(float));
+            cudaMemset(aw.o_proj, 0, hd * qkv * sizeof(float));
+        }
 
         if (config_.has_mla) {
             // MLA (Multi-head Latent Attention): load raw A/B projection matrices.
@@ -298,7 +324,11 @@ bool MoEExecutor::initialize(const std::string& model_path,
             try_load(lp + ".self_attn.k_proj.weight", aw.k_proj, kv * hd * sizeof(float));
             try_load(lp + ".self_attn.v_proj.weight", aw.v_proj, kv * hd * sizeof(float));
         }
-        try_load(lp + ".self_attn.o_proj.weight", aw.o_proj, hd * qkv * sizeof(float));
+        // o_proj: [hidden, n_heads*v_hd] for MLA or [hidden, qkv] for standard
+        size_t o_buf_bytes = config_.has_mla
+            ? hd * (config_.num_attn_heads * (config_.v_head_dim > 0 ? config_.v_head_dim : config_.nope_head_dim)) * sizeof(float)
+            : hd * qkv * sizeof(float);
+        try_load(lp + ".self_attn.o_proj.weight", aw.o_proj, o_buf_bytes);
 
         // Routing gate
         cudaMalloc(&ms.gate_weight, config_.num_experts * hd * sizeof(float));
