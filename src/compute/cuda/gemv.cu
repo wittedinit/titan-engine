@@ -88,6 +88,50 @@ void gemv_fp32_batched(
                 y, 1);
 }
 
+// BF16 matrix × FP32 vector → FP32 output
+// A: [rows, cols] row-major BF16  |  x: [cols] FP32  |  y: [rows] FP32
+// Uses cublasGemmEx: same CUBLAS_OP_T trick as gemv_fp32.
+void gemv_bf16_to_fp32(
+    const void* A, const float* x, float* y,
+    int rows, int cols,
+    cudaStream_t stream
+) {
+    init_cublas();
+    cublasSetStream(g_cublas_handle, stream);
+    float alpha = 1.0f, beta = 0.0f;
+    // Mirror gemv_fp32 layout: A[rows,cols] row-major = [cols,rows] col-major
+    // CUBLAS_OP_T transposes the stored [cols,rows] back to [rows,cols]
+    cublasGemmEx(g_cublas_handle,
+                 CUBLAS_OP_T, CUBLAS_OP_N,
+                 rows, 1, cols,
+                 &alpha,
+                 A, CUDA_R_16BF, cols,
+                 x, CUDA_R_32F, cols,
+                 &beta,
+                 y, CUDA_R_32F, rows,
+                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
+// BF16 embedding lookup: copy and convert row token_id to FP32
+__global__ void bf16_embed_kernel(
+    float* __restrict__ out, const uint16_t* __restrict__ emb,
+    int token_id, int dim
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= dim) return;
+    uint32_t v = (uint32_t)emb[(size_t)token_id * dim + i] << 16;
+    float f;
+    __builtin_memcpy(&f, &v, 4);
+    out[i] = f;
+}
+
+void embed_token_bf16(float* out, const void* emb, int token_id, int dim, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (dim + threads - 1) / threads;
+    bf16_embed_kernel<<<blocks, threads, 0, stream>>>(out, (const uint16_t*)emb, token_id, dim);
+    CUDA_CHECK_LAUNCH();
+}
+
 // Add two vectors: y = a + b (element-wise)
 __global__ void vector_add_kernel(float* y, const float* a, const float* b, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;

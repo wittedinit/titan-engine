@@ -23,9 +23,11 @@ static DType parse_st_dtype(const std::string& s) {
     if (s == "F16")     return DType::FP16;
     if (s == "BF16")    return DType::BF16;
     if (s == "I8")      return DType::INT8;
-    if (s == "I32")     return DType::FP32; // Treat I32 as FP32 size
+    if (s == "U8")      return DType::INT8;   // Unsigned 8-bit — used for packed FP4 (NVFP4)
+    if (s == "I32")     return DType::FP32;   // Treat I32 as FP32 size
     if (s == "F8_E4M3") return DType::FP8_E4M3;
-    return DType::FP16;
+    if (s == "F8_E5M2") return DType::FP8_E5M2;
+    return DType::FP16; // Unknown dtype — assume 2 bytes, log at parse time
 }
 
 // Parse a safetensors JSON header into tensor metadata
@@ -292,30 +294,32 @@ bool ModelLoader::parse_shard_header(size_t shard_idx) {
 }
 
 void ModelLoader::normalize_tensor_names() {
-    // Detect common wrapper prefixes and strip them so downstream code
-    // can use standard names like "model.layers.N.*" regardless of whether
-    // the model uses "language_model.model.layers.N.*" (Kimi K2.5, multimodal
-    // wrappers, etc.)
+    // Strip known LLM wrapper prefixes from tensors that have them.
+    // For pure-text models ALL tensors match; for multimodal models (Kimi K2.5,
+    // LLaVA, etc.) only LLM tensors carry the prefix — vision_tower.* and
+    // mm_projector.* are left untouched. We strip when >= 50% of tensors carry
+    // the prefix, which means it's intentional, not accidental.
     static const std::vector<std::string> prefixes = {
         "language_model.",   // Kimi K2.5, LLaVA-style multimodal wrappers
         "transformer.",      // Some GPT-style models
     };
 
     for (const auto& prefix : prefixes) {
-        // Check if ALL non-metadata tensors start with this prefix
-        bool all_match = !tensors_.empty();
+        size_t match_count = 0;
         for (const auto& [name, _] : tensors_) {
-            if (name.rfind(prefix, 0) != 0) { all_match = false; break; }
+            if (name.rfind(prefix, 0) == 0) match_count++;
         }
 
-        if (all_match) {
-            LOG_INFO("Stripping tensor name prefix '%s' (%zu tensors)",
-                     prefix.c_str(), tensors_.size());
-            // Re-key the entire map
+        // Strip if majority of tensors have this prefix
+        if (match_count > tensors_.size() / 2) {
+            LOG_INFO("Stripping tensor name prefix '%s' (%zu/%zu tensors)",
+                     prefix.c_str(), match_count, tensors_.size());
             std::unordered_map<std::string, TensorLocation> remapped;
             remapped.reserve(tensors_.size());
             for (auto& [name, loc] : tensors_) {
-                std::string new_name = name.substr(prefix.size());
+                std::string new_name = (name.rfind(prefix, 0) == 0)
+                                       ? name.substr(prefix.size())
+                                       : name;
                 loc.meta.name = new_name;
                 remapped[new_name] = std::move(loc);
             }

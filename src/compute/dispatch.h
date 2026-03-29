@@ -89,6 +89,10 @@ namespace cuda {
                    int rows, int cols, cudaStream_t stream);
     void gemv_fp32_batched(const float* A, const float* x, float* y,
                            int rows, int cols, int batch, cudaStream_t stream);
+    void gemv_bf16_to_fp32(const void* A, const float* x, float* y,
+                           int rows, int cols, cudaStream_t stream);
+    void embed_token_bf16(float* out, const void* emb, int token_id, int dim,
+                          cudaStream_t stream);
     void vector_add(float* y, const float* a, const float* b, int n, cudaStream_t stream);
     void vector_copy(float* dst, const float* src, int n, cudaStream_t stream);
 
@@ -96,6 +100,10 @@ namespace cuda {
     void dequant_matvec_fp4(const void* weights, const void* scales,
                             const float* input, float* output,
                             int rows, int cols, int group_size, cudaStream_t stream);
+    // NVFP4: U8 packed (2 FP4/byte), F8_E4M3 scales (group=16), F32 global scale
+    void dequant_matvec_nvfp4(const void* weights, const void* scales, float global_scale,
+                               const float* input, float* output,
+                               int rows, int cols, cudaStream_t stream);
     void quantize_fp4(const float* input, void* output, void* scales,
                       int numel, int group_size, cudaStream_t stream);
 

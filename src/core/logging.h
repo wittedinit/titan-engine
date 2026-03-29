@@ -26,12 +26,12 @@ inline void log_msg(LogLevel level, const char* file, int line, const char* fmt,
     double elapsed = std::chrono::duration<double>(now - start).count();
 
     const char* prefix = "";
-    FILE* out = stdout;
+    FILE* out = stderr;  // All log output goes to stderr so stdout is clean token text
     switch (level) {
         case LogLevel::DEBUG: prefix = "DEBUG"; break;
         case LogLevel::INFO:  prefix = "INFO "; break;
-        case LogLevel::WARN:  prefix = "WARN "; out = stderr; break;
-        case LogLevel::ERROR: prefix = "ERROR"; out = stderr; break;
+        case LogLevel::WARN:  prefix = "WARN "; break;
+        case LogLevel::ERROR: prefix = "ERROR"; break;
         default: break;
     }
 

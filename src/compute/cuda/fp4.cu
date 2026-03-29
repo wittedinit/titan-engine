@@ -158,6 +158,99 @@ void dequant_matvec_fp4(
     CUDA_CHECK_LAUNCH();
 }
 
+// ============================================================================
+// NVFP4 Dequantization + MatVec
+//
+// NVIDIA modelopt NVFP4 format (used by Kimi K2.5, DeepSeek V3 quantized):
+//   - Weights: [rows, cols/2] U8, 2 FP4 E2M1 values per byte (low nibble first)
+//   - Weight scales: [rows, cols/16] F8_E4M3 (one per group of 16 logical FP4 cols)
+//   - Global weight scale: scalar F32 (weight_scale_2, per-tensor multiplier)
+//
+// Dequant formula: y[r] = global * Σ_c fp4(W[r,c]) * f8(scale[r, c/16]) * x[c]
+// ============================================================================
+
+// F8_E4M3 (4 exp bits, 3 mantissa bits, bias=7) to float
+__device__ __forceinline__ float f8e4m3_to_float(uint8_t v) {
+    if ((v & 0x7F) == 0x7F) return 0.0f; // NaN → 0
+    int sign = (v >> 7) & 1;
+    int exp  = (v >> 3) & 0xF;
+    int mant = v & 0x7;
+    float mag;
+    if (exp == 0) {
+        mag = ldexpf((float)mant * (1.0f / 8.0f), 1 - 7);  // subnormal
+    } else {
+        mag = ldexpf(1.0f + (float)mant * (1.0f / 8.0f), exp - 7);  // normal
+    }
+    return sign ? -mag : mag;
+}
+
+__global__ void dequant_matvec_nvfp4_kernel(
+    const uint8_t* __restrict__ weights,    // [rows, cols/2] packed U8 (2 FP4 per byte)
+    const uint8_t* __restrict__ scales,     // [rows, cols/16] F8_E4M3 per-group scales
+    float global_scale,                     // scalar F32 weight_scale_2
+    const float* __restrict__ input,        // [cols] FP32
+    float* __restrict__ output,             // [rows] FP32
+    int rows, int cols
+) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    extern __shared__ float shared_input[];
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        shared_input[i] = input[i];
+    }
+    __syncthreads();
+
+    float acc = 0.0f;
+    int cols_bytes    = cols / 2;   // U8 bytes per row
+    int groups_per_row = cols / 16; // one F8 scale per 16 FP4 values
+
+    const uint8_t* rw = weights + (size_t)row * cols_bytes;
+    const uint8_t* rs = scales  + (size_t)row * groups_per_row;
+
+    for (int byte_col = threadIdx.x; byte_col < cols_bytes; byte_col += blockDim.x) {
+        uint8_t packed = rw[byte_col];
+        int fp4_col0 = byte_col * 2;
+        int fp4_col1 = fp4_col0 + 1;
+
+        float s0 = f8e4m3_to_float(rs[fp4_col0 / 16]) * global_scale;
+        float s1 = f8e4m3_to_float(rs[fp4_col1 / 16]) * global_scale;
+
+        acc += fp4_lut[packed & 0xF]        * s0 * shared_input[fp4_col0];
+        acc += fp4_lut[(packed >> 4) & 0xF] * s1 * shared_input[fp4_col1];
+    }
+
+    // Warp + block reduction
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    __shared__ float warp_sums[32];
+    int warp_id = threadIdx.x / 32;
+    int lane    = threadIdx.x % 32;
+    if (lane == 0) warp_sums[warp_id] = acc;
+    __syncthreads();
+    if (warp_id == 0) {
+        int nw = (blockDim.x + 31) / 32;
+        acc = (lane < nw) ? warp_sums[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+        if (lane == 0) output[row] = acc;
+    }
+}
+
+void dequant_matvec_nvfp4(
+    const void* weights, const void* scales, float global_scale,
+    const float* input, float* output,
+    int rows, int cols, cudaStream_t stream
+) {
+    int block_size = 256;
+    int shared_mem = cols * sizeof(float);
+    dequant_matvec_nvfp4_kernel<<<rows, block_size, shared_mem, stream>>>(
+        (const uint8_t*)weights, (const uint8_t*)scales, global_scale,
+        input, output, rows, cols
+    );
+    CUDA_CHECK_LAUNCH();
+}
+
 void quantize_fp4(
     const float* input, void* output, void* scales,
     int numel, int group_size, cudaStream_t stream

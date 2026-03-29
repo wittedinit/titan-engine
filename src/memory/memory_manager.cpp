@@ -23,6 +23,7 @@ MemoryManager::MemoryManager(const HardwareProfile& hw, const RuntimeConfig& cfg
 
     std::string nvme_path = cfg.nvme_cache_path.empty() ? cfg.model_path : cfg.nvme_cache_path;
     nvme_ = std::make_unique<NvmePool>(nvme_path, cfg.nvme_cache_mb * 1024ULL * 1024);
+    expert_base_path_ = nvme_path;
     LOG_INFO("NVMe pool: %s", nvme_path.c_str());
 
     // Expert cache budget: use remaining RAM after model weights

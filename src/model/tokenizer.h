@@ -65,11 +65,17 @@ private:
     int pad_id_ = -1;
     std::unordered_map<int, bool> special_ids_;
 
+    // Format flag
+    bool is_tiktoken_ = false;
+
     // Internal BPE methods
     void init_byte_encoding();
     std::vector<std::string> pre_tokenize(const std::string& text) const;
     std::vector<std::string> bpe_encode_word(const std::string& word) const;
     bool parse_tokenizer_json(const std::string& path);
+    bool parse_tiktoken(const std::string& tiktoken_path, const std::string& tokenizer_json_path);
+    std::vector<int> encode_tiktoken(const std::string& text, bool add_bos) const;
+    std::vector<int> tiktoken_bpe_word(const std::string& bytes) const;
     bool parse_special_tokens(const std::string& model_dir);
 };
 

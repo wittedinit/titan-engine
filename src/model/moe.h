@@ -5,6 +5,8 @@
 #include "model/tokenizer.h"
 #include "inference/kv_cache.h"
 
+#include <memory>
+
 namespace titan {
 
 // ============================================================================
@@ -59,13 +61,16 @@ private:
         void* v_proj = nullptr;
         void* o_proj = nullptr;
         // MLA (Multi-head Latent Attention) projections — DeepSeek V3 / Kimi K2 style
-        // Two-hop attention: compress to latent then expand to heads
-        float* q_a_proj = nullptr;      // [q_lora_rank, hidden]
-        float* q_b_proj = nullptr;      // [n_heads*(nope_hd+rope_hd), q_lora_rank]
-        float* q_a_norm = nullptr;      // [q_lora_rank]
-        float* kv_a_proj = nullptr;     // [kv_lora_rank+rope_hd, hidden]
-        float* kv_b_proj = nullptr;     // [n_kv_heads*(nope_hd+v_hd), kv_lora_rank]
-        float* kv_a_norm = nullptr;     // [kv_lora_rank]
+        // Two-hop attention: compress to latent then expand to heads.
+        // Stored in BF16 on GPU to halve VRAM (25 GB → 12.5 GB for 61-layer model).
+        // Dispatch uses gemv_bf16_to_fp32 for compute.
+        void* q_a_proj = nullptr;       // [q_lora_rank, hidden]     BF16
+        void* q_b_proj = nullptr;       // [n_heads*(nope_hd+rope_hd), q_lora_rank]  BF16
+        float* q_a_norm = nullptr;      // [q_lora_rank]             FP32 (tiny, norm weight)
+        void* kv_a_proj = nullptr;      // [kv_lora_rank+rope_hd, hidden]  BF16
+        void* kv_b_proj = nullptr;      // [n_kv_heads*(nope_hd+v_hd), kv_lora_rank]  BF16
+        float* kv_a_norm = nullptr;     // [kv_lora_rank]            FP32 (tiny, norm weight)
+        // Note: for MLA models, o_proj (above) stores BF16 data [hidden, n_heads*v_hd]
     };
     std::vector<AttentionWeights> attn_weights_;
 
@@ -81,10 +86,28 @@ private:
     std::string expert_dir_;
     size_t expert_bytes_ = 0;
 
+    // NVFP4 expert loading
+    bool has_nvfp4_ = false;
+    std::unique_ptr<ModelLoader> loader_;  // kept alive for on-demand expert reads
+
+    // NVFP4 per-expert layout sizes (bytes) within a staging buffer
+    size_t nvfp4_gate_w_bytes_  = 0;  // gate.weight [inter, hd/2] U8
+    size_t nvfp4_gate_s_bytes_  = 0;  // gate.weight_scale [inter, hd/16] F8
+    size_t nvfp4_up_w_bytes_    = 0;  // up.weight [inter, hd/2] U8
+    size_t nvfp4_up_s_bytes_    = 0;  // up.weight_scale [inter, hd/16] F8
+    size_t nvfp4_down_w_bytes_  = 0;  // down.weight [hd, inter/2] U8
+    size_t nvfp4_down_s_bytes_  = 0;  // down.weight_scale [hd, inter/16] F8
+
+    // CPU-side buffer for loading one expert at a time (pinned, host memory)
+    void* nvfp4_load_buf_ = nullptr;
+
     // Embedding + LM head
-    float* embedding_ = nullptr;
-    void* lm_head_ = nullptr;
+    // Stored in BF16 when on-disk format is BF16 (saves 2.35 GB for 163K vocab, hidden=7168).
+    // Use embed_token_bf16() for lookup; gemv_bf16_to_fp32() for lm_head projection.
+    void* embedding_ = nullptr;    // BF16 or FP32 (see embedding_is_bf16_)
+    void* lm_head_ = nullptr;      // BF16 or FP32 (same format as embedding_)
     float* final_norm_ = nullptr;
+    bool embedding_is_bf16_ = false;
 
     // Pre-allocated scratch buffers (no per-token mallocs!)
     float* q_buf_ = nullptr;    // Q output (full heads)
@@ -116,6 +139,11 @@ private:
 
     void allocate_buffers();
     void free_buffers();
+
+    // Load one NVFP4 expert from safetensors into gpu_buf (already on GPU).
+    // Returns false if the expert tensors aren't found in the loader.
+    bool load_nvfp4_expert(uint32_t layer_id, uint32_t expert_id,
+                           void* gpu_buf, cudaStream_t stream);
 };
 
 } // namespace titan
