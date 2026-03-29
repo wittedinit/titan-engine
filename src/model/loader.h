@@ -81,6 +81,7 @@ private:
     bool load_single(const std::string& st_path);
     bool load_sharded(const std::string& index_path);
     bool parse_shard_header(size_t shard_idx);
+    void normalize_tensor_names();  // Strip known wrapper prefixes (e.g. "language_model.")
 };
 
 } // namespace titan

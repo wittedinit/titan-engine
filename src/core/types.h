@@ -200,6 +200,16 @@ struct ModelConfig {
     uint32_t        experts_per_tok     = 0;
     uint32_t        num_shared_experts  = 0;
     uint32_t        moe_intermediate_dim = 0;
+    uint32_t        first_k_dense_replace = 0;  // First N layers use dense MLP
+    uint32_t        moe_layer_freq      = 1;    // Every Nth layer is MoE (1 = all)
+
+    // MLA (Multi-head Latent Attention) config — DeepSeek V3 / Kimi K2 style
+    bool            has_mla         = false;
+    uint32_t        kv_lora_rank    = 0;    // KV compression rank (0 = standard GQA)
+    uint32_t        q_lora_rank     = 0;    // Q compression rank
+    uint32_t        rope_head_dim   = 0;    // Decoupled RoPE head dim (MLA only)
+    uint32_t        nope_head_dim   = 0;    // Non-RoPE head dim (MLA only)
+    uint32_t        v_head_dim      = 0;    // Value head dim (MLA only, may differ from K)
 
     // Attention config
     float           rope_theta      = 10000.0f;

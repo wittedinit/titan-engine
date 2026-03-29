@@ -194,6 +194,7 @@ bool ModelLoader::load_single(const std::string& st_path) {
     }
 
     LOG_INFO("Loaded %zu tensors from %s", metas.size(), st_path.c_str());
+    normalize_tensor_names();
     return true;
 }
 
@@ -263,6 +264,7 @@ bool ModelLoader::load_sharded(const std::string& index_path) {
     }
 
     LOG_INFO("Loaded %zu shards, %zu tensors", shards_.size(), tensors_.size());
+    normalize_tensor_names();
     return true;
 }
 
@@ -287,6 +289,40 @@ bool ModelLoader::parse_shard_header(size_t shard_idx) {
     }
 
     return true;
+}
+
+void ModelLoader::normalize_tensor_names() {
+    // Detect common wrapper prefixes and strip them so downstream code
+    // can use standard names like "model.layers.N.*" regardless of whether
+    // the model uses "language_model.model.layers.N.*" (Kimi K2.5, multimodal
+    // wrappers, etc.)
+    static const std::vector<std::string> prefixes = {
+        "language_model.",   // Kimi K2.5, LLaVA-style multimodal wrappers
+        "transformer.",      // Some GPT-style models
+    };
+
+    for (const auto& prefix : prefixes) {
+        // Check if ALL non-metadata tensors start with this prefix
+        bool all_match = !tensors_.empty();
+        for (const auto& [name, _] : tensors_) {
+            if (name.rfind(prefix, 0) != 0) { all_match = false; break; }
+        }
+
+        if (all_match) {
+            LOG_INFO("Stripping tensor name prefix '%s' (%zu tensors)",
+                     prefix.c_str(), tensors_.size());
+            // Re-key the entire map
+            std::unordered_map<std::string, TensorLocation> remapped;
+            remapped.reserve(tensors_.size());
+            for (auto& [name, loc] : tensors_) {
+                std::string new_name = name.substr(prefix.size());
+                loc.meta.name = new_name;
+                remapped[new_name] = std::move(loc);
+            }
+            tensors_ = std::move(remapped);
+            break;  // Only strip one prefix
+        }
+    }
 }
 
 bool ModelLoader::has_tensor(const std::string& name) const {

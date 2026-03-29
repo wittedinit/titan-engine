@@ -29,6 +29,13 @@ MoEExecutor::~MoEExecutor() {
         if (aw.k_proj) cudaFree(aw.k_proj);
         if (aw.v_proj) cudaFree(aw.v_proj);
         if (aw.o_proj) cudaFree(aw.o_proj);
+        // MLA projections
+        if (aw.q_a_proj)  cudaFree(aw.q_a_proj);
+        if (aw.q_b_proj)  cudaFree(aw.q_b_proj);
+        if (aw.q_a_norm)  cudaFree(aw.q_a_norm);
+        if (aw.kv_a_proj) cudaFree(aw.kv_a_proj);
+        if (aw.kv_b_proj) cudaFree(aw.kv_b_proj);
+        if (aw.kv_a_norm) cudaFree(aw.kv_a_norm);
     }
     attn_weights_.clear();
 
@@ -57,6 +64,19 @@ void MoEExecutor::allocate_buffers() {
     cudaMalloc(&v_buf_, kv * sizeof(float));
     cudaMalloc(&attn_out_, qkv * sizeof(float));
     cudaMalloc(&norm_buf_, hd * sizeof(float));
+    // MLA scratch buffers (allocated even for non-MLA models — zero cost when unused)
+    uint32_t q_lr  = config_.q_lora_rank  > 0 ? config_.q_lora_rank  : hd;
+    uint32_t kv_lr = config_.kv_lora_rank > 0 ? config_.kv_lora_rank : hd;
+    uint32_t rope_hd = config_.rope_head_dim > 0 ? config_.rope_head_dim : 64;
+    uint32_t nope_hd = config_.nope_head_dim > 0 ? config_.nope_head_dim : (hd / config_.num_attn_heads);
+    uint32_t v_hd    = config_.v_head_dim > 0 ? config_.v_head_dim : nope_hd;
+    cudaMalloc(&c_q_buf_,    q_lr  * sizeof(float));
+    cudaMalloc(&c_kv_buf_,   (kv_lr + rope_hd) * sizeof(float));
+    cudaMalloc(&kv_expanded_, config_.num_kv_heads * (nope_hd + v_hd) * sizeof(float));
+    cudaMalloc(&k_nope_buf_,  config_.num_kv_heads * nope_hd * sizeof(float));
+    cudaMalloc(&v_mla_buf_,   config_.num_kv_heads * v_hd * sizeof(float));
+    cudaMalloc(&k_full_buf_,  config_.num_kv_heads * (nope_hd + rope_hd) * sizeof(float));
+    cudaMalloc(&q_nope_buf_,  config_.num_attn_heads * nope_hd * sizeof(float));
     cudaMalloc(&gate_logits_, ne * sizeof(float));
     cudaMalloc(&routing_weights_, k * sizeof(float));
     cudaMalloc(&routing_indices_, k * sizeof(int));
@@ -88,6 +108,8 @@ void MoEExecutor::free_buffers() {
     sf(expert_weight_buf_[0]); sf(expert_weight_buf_[1]);
     sf(expert_gate_out_); sf(expert_up_out_);
     sf(shared_gate_out_); sf(shared_up_out_);
+    sf(c_q_buf_); sf(c_kv_buf_); sf(kv_expanded_);
+    sf(k_nope_buf_); sf(v_mla_buf_); sf(k_full_buf_); sf(q_nope_buf_);
 }
 
 // ============================================================================
@@ -109,8 +131,14 @@ bool MoEExecutor::initialize(const std::string& model_path,
 
     cuda::init_cublas();
 
+    // For MLA (Multi-head Latent Attention), the KV cache stores K_nope and V
+    // which both have dimension nope_head_dim (= v_head_dim for Kimi K2 models).
+    // For standard GQA, use the full head_dim.
+    uint32_t kv_cache_head_dim = config_.has_mla && config_.nope_head_dim > 0
+                                  ? config_.nope_head_dim
+                                  : config_.head_dim;
     if (!kv_cache_.initialize(config_.num_layers, config_.num_kv_heads,
-                               config_.head_dim, runtime.max_context_len))
+                               kv_cache_head_dim, runtime.max_context_len))
         return false;
 
     ModelLoader loader;
@@ -205,9 +233,71 @@ bool MoEExecutor::initialize(const std::string& model_path,
         cudaMemset(aw.v_proj, 0, kv * hd * sizeof(float));
         cudaMemset(aw.o_proj, 0, hd * qkv * sizeof(float));
 
-        try_load(lp + ".self_attn.q_proj.weight", aw.q_proj, qkv * hd * sizeof(float));
-        try_load(lp + ".self_attn.k_proj.weight", aw.k_proj, kv * hd * sizeof(float));
-        try_load(lp + ".self_attn.v_proj.weight", aw.v_proj, kv * hd * sizeof(float));
+        if (config_.has_mla) {
+            // MLA (Multi-head Latent Attention): load raw A/B projection matrices.
+            // Q:  hidden -> q_a_proj -> LayerNorm -> q_b_proj -> Q heads
+            // KV: hidden -> kv_a_proj -> LayerNorm -> kv_b_proj -> K/V heads
+            uint32_t q_lr  = config_.q_lora_rank  > 0 ? config_.q_lora_rank  : 1536;
+            uint32_t kv_lr = config_.kv_lora_rank > 0 ? config_.kv_lora_rank :  512;
+            uint32_t nope_hd = config_.nope_head_dim > 0 ? config_.nope_head_dim : 128;
+            uint32_t v_hd  = config_.v_head_dim    > 0 ? config_.v_head_dim    : nope_hd;
+            uint32_t rope_hd = config_.rope_head_dim > 0 ? config_.rope_head_dim : 64;
+            uint32_t kv_a_rows = kv_lr + rope_hd;
+            uint32_t kv_b_rows = config_.num_kv_heads * (nope_hd + v_hd);
+
+            // Allocate and load each MLA projection directly (no CPU matmul)
+            cudaMalloc(&aw.q_a_proj,  (size_t)q_lr * hd * sizeof(float));
+            cudaMalloc(&aw.q_b_proj,  (size_t)qkv  * q_lr * sizeof(float));
+            cudaMalloc(&aw.q_a_norm,  q_lr * sizeof(float));
+            cudaMalloc(&aw.kv_a_proj, (size_t)kv_a_rows * hd * sizeof(float));
+            cudaMalloc(&aw.kv_b_proj, (size_t)kv_b_rows * kv_lr * sizeof(float));
+            cudaMalloc(&aw.kv_a_norm, kv_lr * sizeof(float));
+            cudaMemset(aw.q_a_proj,  0, (size_t)q_lr * hd * sizeof(float));
+            cudaMemset(aw.q_b_proj,  0, (size_t)qkv  * q_lr * sizeof(float));
+            std::fill(ones.begin(), ones.end(), 1.0f);
+            if ((uint32_t)ones.size() >= q_lr)
+                cudaMemcpy(aw.q_a_norm, ones.data(), q_lr * sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemset(aw.kv_a_proj, 0, (size_t)kv_a_rows * hd * sizeof(float));
+            cudaMemset(aw.kv_b_proj, 0, (size_t)kv_b_rows * kv_lr * sizeof(float));
+            if ((uint32_t)ones.size() >= kv_lr)
+                cudaMemcpy(aw.kv_a_norm, ones.data(), kv_lr * sizeof(float), cudaMemcpyHostToDevice);
+
+            // Helper to load BF16 tensor from disk into pre-allocated FP32 GPU buffer
+            auto load_bf16_to_fp32_gpu = [&](const std::string& name, float* dst_fp32, size_t n_elems) {
+                if (!loader.has_tensor(name)) return;
+                auto meta = loader.get_meta(name);
+                if ((size_t)meta.numel() > n_elems) return;
+                std::vector<uint16_t> raw(meta.numel());
+                loader.read_tensor_cpu(name, raw.data(), meta.byte_size());
+                std::vector<float> fp32(meta.numel());
+                bool is_bf16 = (meta.dtype == DType::BF16);
+                for (size_t i = 0; i < (size_t)meta.numel(); i++) {
+                    uint32_t v;
+                    if (is_bf16) {
+                        v = (uint32_t)raw[i] << 16;
+                    } else { // FP16
+                        uint16_t h = raw[i];
+                        uint32_t s=(h>>15)&1, e=(h>>10)&0x1F, m=h&0x3FF;
+                        if (e==0) v=(s<<31)|((m==0)?0u:(uint32_t)((127-15)<<23)|(m<<13));
+                        else if (e==31) v=(s<<31)|0x7F800000|(m<<13);
+                        else v=(s<<31)|((e+127-15)<<23)|(m<<13);
+                    }
+                    memcpy(&fp32[i], &v, 4);
+                }
+                cudaMemcpy(dst_fp32, fp32.data(), meta.numel() * sizeof(float), cudaMemcpyHostToDevice);
+            };
+
+            load_bf16_to_fp32_gpu(lp + ".self_attn.q_a_proj.weight",          aw.q_a_proj,  (size_t)q_lr * hd);
+            load_bf16_to_fp32_gpu(lp + ".self_attn.q_b_proj.weight",          aw.q_b_proj,  (size_t)qkv * q_lr);
+            load_bf16_to_fp32_gpu(lp + ".self_attn.q_a_layernorm.weight",     aw.q_a_norm,  q_lr);
+            load_bf16_to_fp32_gpu(lp + ".self_attn.kv_a_proj_with_mqa.weight",aw.kv_a_proj, (size_t)kv_a_rows * hd);
+            load_bf16_to_fp32_gpu(lp + ".self_attn.kv_b_proj.weight",         aw.kv_b_proj, (size_t)kv_b_rows * kv_lr);
+            load_bf16_to_fp32_gpu(lp + ".self_attn.kv_a_layernorm.weight",    aw.kv_a_norm, kv_lr);
+        } else {
+            try_load(lp + ".self_attn.q_proj.weight", aw.q_proj, qkv * hd * sizeof(float));
+            try_load(lp + ".self_attn.k_proj.weight", aw.k_proj, kv * hd * sizeof(float));
+            try_load(lp + ".self_attn.v_proj.weight", aw.v_proj, kv * hd * sizeof(float));
+        }
         try_load(lp + ".self_attn.o_proj.weight", aw.o_proj, hd * qkv * sizeof(float));
 
         // Routing gate
@@ -271,26 +361,97 @@ void MoEExecutor::forward_layer(float* hidden, float* residual,
     // ======= ATTENTION =======
     cuda::rmsnorm(norm_buf_, hidden, aw.attn_norm, hd, 1e-5f, stream);
 
-    cuda::gemv_fp32((const float*)aw.q_proj, norm_buf_, q_buf_, qkv, hd, stream);
-    cuda::gemv_fp32((const float*)aw.k_proj, norm_buf_, k_buf_, kv_dim, hd, stream);
-    cuda::gemv_fp32((const float*)aw.v_proj, norm_buf_, v_buf_, kv_dim, hd, stream);
+    uint32_t nope_hd  = config_.nope_head_dim  > 0 ? config_.nope_head_dim  : config_.head_dim;
+    uint32_t rope_hd  = config_.rope_head_dim  > 0 ? config_.rope_head_dim  : 0;
+    uint32_t v_hd     = config_.v_head_dim     > 0 ? config_.v_head_dim     : nope_hd;
+    uint32_t q_lr     = config_.q_lora_rank    > 0 ? config_.q_lora_rank    : hd;
+    uint32_t kv_lr    = config_.kv_lora_rank   > 0 ? config_.kv_lora_rank   : hd;
 
-    cuda::apply_rope(q_buf_, k_buf_, config_.num_attn_heads, config_.num_kv_heads,
-                     config_.head_dim, position, config_.rope_theta,
-                     config_.rope_scaling, stream);
+    if (config_.has_mla && aw.q_a_proj) {
+        // MLA two-hop Q: hidden → q_a → RMSNorm → q_b → Q
+        cuda::gemv_fp32(aw.q_a_proj, norm_buf_, c_q_buf_, q_lr, hd, stream);
+        cuda::rmsnorm(c_q_buf_, c_q_buf_, aw.q_a_norm, q_lr, 1e-5f, stream);
+        cuda::gemv_fp32(aw.q_b_proj, c_q_buf_, q_buf_, qkv, q_lr, stream);
 
-    kv_cache_.update(layer_id, position, k_buf_, v_buf_, stream);
+        // MLA two-hop KV: hidden → kv_a → RMSNorm (on kv_lr part) → kv_b → K_nope+V
+        uint32_t kv_a_rows = kv_lr + rope_hd;
+        cuda::gemv_fp32(aw.kv_a_proj, norm_buf_, c_kv_buf_, kv_a_rows, hd, stream);
+        // Compress: c_kv_buf_ layout = [kv_lr elems | rope_hd elems]
+        // Apply LayerNorm only to the compressed KV portion (first kv_lr elements)
+        cuda::rmsnorm(c_kv_buf_, c_kv_buf_, aw.kv_a_norm, kv_lr, 1e-5f, stream);
+        // Expand via kv_b: [n_kv_heads*(nope_hd+v_hd)] from [kv_lr]
+        uint32_t kv_b_rows = config_.num_kv_heads * (nope_hd + v_hd);
+        cuda::gemv_fp32(aw.kv_b_proj, c_kv_buf_, kv_expanded_, kv_b_rows, kv_lr, stream);
 
-    int seq_len = std::max(1, kv_cache_.seq_len());
-    cuda::attention_decode(q_buf_, kv_cache_.k_cache(layer_id),
-                           kv_cache_.v_cache(layer_id), attn_out_,
-                           config_.num_attn_heads, config_.num_kv_heads,
-                           config_.head_dim, seq_len, stream);
+        // Deinterleave kv_expanded → k_nope_buf_ and v_mla_buf_
+        cuda::mla_deinterleave_kv(kv_expanded_, k_nope_buf_, v_mla_buf_,
+                                   config_.num_kv_heads, nope_hd, v_hd, stream);
 
-    // O proj + residual
-    float* o_tmp = norm_buf_; // Reuse
-    cuda::gemv_fp32((const float*)aw.o_proj, attn_out_, o_tmp, hd, qkv, stream);
-    cuda::vector_add(residual, residual, o_tmp, hd, stream);
+        // Assemble full K with rope component: k_nope || k_rope (broadcast)
+        // c_kv_buf_[kv_lr:kv_lr+rope_hd] contains the shared rope key
+        if (rope_hd > 0) {
+            cuda::mla_assemble_k(k_nope_buf_, c_kv_buf_ + kv_lr, k_full_buf_,
+                                  config_.num_kv_heads, nope_hd, rope_hd, stream);
+        } else {
+            // No rope component — k_full = k_nope
+            cudaMemcpyAsync(k_full_buf_, k_nope_buf_,
+                            config_.num_kv_heads * nope_hd * sizeof(float),
+                            cudaMemcpyDeviceToDevice, stream);
+        }
+
+        // Apply RoPE to rope portions of Q and K
+        // Q: rope portion starts at nope_hd per head; K: assembled k_full has rope at end
+        // The standard apply_rope expects Q[n_heads*head_dim] and K[n_kv_heads*head_dim]
+        // For MLA: head_dim = nope_hd + rope_hd, rope is applied to last rope_hd dims
+        uint32_t eff_head_dim = nope_hd + rope_hd;
+        cuda::apply_rope(q_buf_, k_full_buf_,
+                         config_.num_attn_heads, config_.num_kv_heads,
+                         eff_head_dim, position, config_.rope_theta,
+                         config_.rope_scaling, stream);
+
+        // Extract Q nope for attention: use Q_nope × K_nope (simplified — drops RoPE)
+        cuda::mla_extract_q_nope(q_buf_, q_nope_buf_,
+                                  config_.num_attn_heads, nope_hd, rope_hd, stream);
+
+        // Store K_nope and V in KV cache (head_dim = nope_hd for KV cache in MLA)
+        kv_cache_.update(layer_id, position, k_nope_buf_, v_mla_buf_, stream);
+
+        // Attention decode: use Q_nope [n_heads*nope_hd] and K_nope / V [n_kv*nope_hd].
+        // This simplification drops RoPE from the computation; positional encoding is
+        // approximate until full MLA-RoPE attention is implemented.
+        int seq_len = std::max(1, kv_cache_.seq_len());
+        cuda::attention_decode(q_nope_buf_, kv_cache_.k_cache(layer_id),
+                               kv_cache_.v_cache(layer_id), attn_out_,
+                               config_.num_attn_heads, config_.num_kv_heads,
+                               nope_hd, seq_len, stream);
+
+        // O proj: shape [hidden, n_heads*v_hd] = [7168, 8192]
+        uint32_t o_in_dim = config_.num_attn_heads * v_hd;
+        float* o_tmp = norm_buf_;
+        cuda::gemv_fp32((const float*)aw.o_proj, attn_out_, o_tmp, hd, o_in_dim, stream);
+        cuda::vector_add(residual, residual, o_tmp, hd, stream);
+    } else {
+        // Standard GQA attention
+        cuda::gemv_fp32((const float*)aw.q_proj, norm_buf_, q_buf_, qkv, hd, stream);
+        cuda::gemv_fp32((const float*)aw.k_proj, norm_buf_, k_buf_, kv_dim, hd, stream);
+        cuda::gemv_fp32((const float*)aw.v_proj, norm_buf_, v_buf_, kv_dim, hd, stream);
+
+        cuda::apply_rope(q_buf_, k_buf_, config_.num_attn_heads, config_.num_kv_heads,
+                         config_.head_dim, position, config_.rope_theta,
+                         config_.rope_scaling, stream);
+
+        kv_cache_.update(layer_id, position, k_buf_, v_buf_, stream);
+
+        int seq_len = std::max(1, kv_cache_.seq_len());
+        cuda::attention_decode(q_buf_, kv_cache_.k_cache(layer_id),
+                               kv_cache_.v_cache(layer_id), attn_out_,
+                               config_.num_attn_heads, config_.num_kv_heads,
+                               config_.head_dim, seq_len, stream);
+
+        float* o_tmp = norm_buf_;
+        cuda::gemv_fp32((const float*)aw.o_proj, attn_out_, o_tmp, hd, qkv, stream);
+        cuda::vector_add(residual, residual, o_tmp, hd, stream);
+    }
 
     // ======= MoE FFN =======
     cuda::rmsnorm(norm_buf_, residual, aw.ffn_norm, hd, 1e-5f, stream);

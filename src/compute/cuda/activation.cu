@@ -212,5 +212,111 @@ void fused_moe_combine_norm(
     CUDA_CHECK_LAUNCH();
 }
 
+// ============================================================================
+// MLA Helpers — Multi-head Latent Attention (DeepSeek V3 / Kimi K2 style)
+// ============================================================================
+
+// Split interleaved kv_b_proj output [n_heads*(nope_hd+v_hd)] into
+// separate k_nope [n_heads*nope_hd] and v [n_heads*v_hd] buffers.
+// kv_expanded layout: [head0_k_nope(nope_hd) | head0_v(v_hd) | head1_k_nope | ...]
+__global__ void mla_deinterleave_kv_kernel(
+    const float* __restrict__ kv_expanded,  // [n_heads * (nope_hd + v_hd)]
+    float*       __restrict__ k_nope,       // [n_heads * nope_hd]
+    float*       __restrict__ v,            // [n_heads * v_hd]
+    int n_heads, int nope_hd, int v_hd
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = nope_hd + v_hd;
+    int total = n_heads * stride;
+    if (idx >= total) return;
+
+    int head = idx / stride;
+    int off  = idx % stride;
+
+    if (off < nope_hd) {
+        k_nope[head * nope_hd + off] = kv_expanded[idx];
+    } else {
+        v[head * v_hd + (off - nope_hd)] = kv_expanded[idx];
+    }
+}
+
+// Assemble full K [n_heads*(nope_hd+rope_hd)] from k_nope and a shared k_rope vector.
+// k_rope is the same for all heads (broadcast).
+__global__ void mla_assemble_k_kernel(
+    const float* __restrict__ k_nope,    // [n_heads * nope_hd]
+    const float* __restrict__ k_rope_dec,// [rope_hd] — shared across all heads
+    float*       __restrict__ k_out,     // [n_heads * (nope_hd + rope_hd)]
+    int n_heads, int nope_hd, int rope_hd
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int head_dim = nope_hd + rope_hd;
+    int total = n_heads * head_dim;
+    if (idx >= total) return;
+
+    int head = idx / head_dim;
+    int off  = idx % head_dim;
+
+    if (off < nope_hd) {
+        k_out[idx] = k_nope[head * nope_hd + off];
+    } else {
+        k_out[idx] = k_rope_dec[off - nope_hd];
+    }
+}
+
+// Extract the nope portion of MLA Q for attention (drops rope_hd dims per head).
+// Attention only needs the full Q for the RoPE dot product; for the nope-only
+// dot product we'd normally need to split per head. This helper keeps the
+// first nope_hd dims of each head and discards rope_hd dims.
+__global__ void mla_extract_q_nope_kernel(
+    const float* __restrict__ q_full,    // [n_heads * (nope_hd + rope_hd)]
+    float*       __restrict__ q_nope,    // [n_heads * nope_hd]
+    int n_heads, int nope_hd, int rope_hd
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_heads * nope_hd) return;
+    int head = idx / nope_hd;
+    int off  = idx % nope_hd;
+    q_nope[idx] = q_full[head * (nope_hd + rope_hd) + off];
+}
+
+void mla_deinterleave_kv(
+    const float* kv_expanded, float* k_nope, float* v,
+    int n_heads, int nope_hd, int v_hd, cudaStream_t stream
+) {
+    int total = n_heads * (nope_hd + v_hd);
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    mla_deinterleave_kv_kernel<<<blocks, threads, 0, stream>>>(
+        kv_expanded, k_nope, v, n_heads, nope_hd, v_hd
+    );
+    CUDA_CHECK_LAUNCH();
+}
+
+void mla_assemble_k(
+    const float* k_nope, const float* k_rope_dec, float* k_out,
+    int n_heads, int nope_hd, int rope_hd, cudaStream_t stream
+) {
+    int total = n_heads * (nope_hd + rope_hd);
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    mla_assemble_k_kernel<<<blocks, threads, 0, stream>>>(
+        k_nope, k_rope_dec, k_out, n_heads, nope_hd, rope_hd
+    );
+    CUDA_CHECK_LAUNCH();
+}
+
+void mla_extract_q_nope(
+    const float* q_full, float* q_nope,
+    int n_heads, int nope_hd, int rope_hd, cudaStream_t stream
+) {
+    int total = n_heads * nope_hd;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    mla_extract_q_nope_kernel<<<blocks, threads, 0, stream>>>(
+        q_full, q_nope, n_heads, nope_hd, rope_hd
+    );
+    CUDA_CHECK_LAUNCH();
+}
+
 } // namespace cuda
 } // namespace titan

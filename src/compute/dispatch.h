@@ -50,6 +50,14 @@ namespace cuda {
     void fused_add_rmsnorm(float* output, float* residual, const float* hidden,
                             const float* weight, int dim, float eps,
                             cudaStream_t stream);
+    // --- MLA helpers (activation.cu) ---
+    void mla_deinterleave_kv(const float* kv_expanded, float* k_nope, float* v,
+                             int n_heads, int nope_hd, int v_hd, cudaStream_t stream);
+    void mla_assemble_k(const float* k_nope, const float* k_rope_dec, float* k_out,
+                        int n_heads, int nope_hd, int rope_hd, cudaStream_t stream);
+    void mla_extract_q_nope(const float* q_full, float* q_nope,
+                            int n_heads, int nope_hd, int rope_hd, cudaStream_t stream);
+
     void fused_moe_combine_norm(float* output, float* residual,
                                  const float* expert_outputs, const float* routing_weights,
                                  const float* shared_expert, float shared_weight,

@@ -53,10 +53,19 @@ private:
     struct AttentionWeights {
         float* attn_norm = nullptr;
         float* ffn_norm = nullptr;
+        // Standard GQA projections (non-MLA models)
         void* q_proj = nullptr;
         void* k_proj = nullptr;
         void* v_proj = nullptr;
         void* o_proj = nullptr;
+        // MLA (Multi-head Latent Attention) projections — DeepSeek V3 / Kimi K2 style
+        // Two-hop attention: compress to latent then expand to heads
+        float* q_a_proj = nullptr;      // [q_lora_rank, hidden]
+        float* q_b_proj = nullptr;      // [n_heads*(nope_hd+rope_hd), q_lora_rank]
+        float* q_a_norm = nullptr;      // [q_lora_rank]
+        float* kv_a_proj = nullptr;     // [kv_lora_rank+rope_hd, hidden]
+        float* kv_b_proj = nullptr;     // [n_kv_heads*(nope_hd+v_hd), kv_lora_rank]
+        float* kv_a_norm = nullptr;     // [kv_lora_rank]
     };
     std::vector<AttentionWeights> attn_weights_;
 
@@ -78,9 +87,17 @@ private:
     float* final_norm_ = nullptr;
 
     // Pre-allocated scratch buffers (no per-token mallocs!)
-    float* q_buf_ = nullptr;
-    float* k_buf_ = nullptr;
-    float* v_buf_ = nullptr;
+    float* q_buf_ = nullptr;    // Q output (full heads)
+    float* k_buf_ = nullptr;    // K output
+    float* v_buf_ = nullptr;    // V output
+    // MLA scratch — compressed latents
+    float* c_q_buf_    = nullptr; // [q_lora_rank] — compressed Q latent
+    float* c_kv_buf_   = nullptr; // [kv_lora_rank + rope_hd] — compressed KV + rope key
+    float* kv_expanded_ = nullptr; // [n_kv_heads*(nope_hd+v_hd)] — expanded KV before split
+    float* k_nope_buf_  = nullptr; // [n_kv_heads*nope_hd] — K nope portion from MLA
+    float* v_mla_buf_   = nullptr; // [n_kv_heads*v_hd] — V from MLA
+    float* k_full_buf_  = nullptr; // [n_kv_heads*(nope_hd+rope_hd)] — assembled K with RoPE
+    float* q_nope_buf_  = nullptr; // [n_attn_heads*nope_hd] — Q nope for attention dot product
     float* attn_out_ = nullptr;
     float* norm_buf_ = nullptr;
     float* gate_logits_ = nullptr;
