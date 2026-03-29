@@ -109,59 +109,32 @@ __global__ void fused_add_rmsnorm_kernel(
 // ============================================================================
 
 __global__ void fused_moe_combine_norm_kernel(
-    float*       __restrict__ output,           // [dim] — final normalized output
-    float*       __restrict__ residual,         // [dim] — residual (modified in-place)
+    float*       __restrict__ output,           // [dim] — updated hidden (= residual after combine)
+    float*       __restrict__ residual,         // [dim] — residual stream (modified in-place)
     const float* __restrict__ expert_outputs,   // [num_active, dim]
     const float* __restrict__ routing_weights,  // [num_active]
     const float* __restrict__ shared_expert,    // [dim] or nullptr
     float        shared_weight,                 // Weight for shared expert (if present)
-    const float* __restrict__ norm_weight,      // [dim]
-    int dim, int num_active, float eps
+    const float* __restrict__ norm_weight,      // [dim] — unused (kept for ABI compat)
+    int dim, int num_active, float eps          // eps unused (kept for ABI compat)
 ) {
-    extern __shared__ float shared[];
-
-    // Step 1: Weighted sum of expert outputs + shared expert + residual
-    float sum_sq = 0.0f;
+    // Combine expert outputs into the residual stream, then copy to output.
+    // Normalization is NOT applied here — each layer's forward_layer applies
+    // rmsnorm at its own start, so pre-norming here would double-apply it.
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         float combined = 0.0f;
 
-        // Sum active expert outputs with routing weights
         for (int e = 0; e < num_active; e++) {
             combined += expert_outputs[e * dim + i] * routing_weights[e];
         }
 
-        // Add shared expert if present
         if (shared_expert) {
             combined += shared_expert[i] * shared_weight;
         }
 
-        // Residual connection
         float val = residual[i] + combined;
         residual[i] = val;
-        sum_sq += val * val;
-    }
-
-    // Reduce and normalize (same pattern as rmsnorm)
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
-    }
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
-    if (lane_id == 0) shared[warp_id] = sum_sq;
-    __syncthreads();
-    if (warp_id == 0) {
-        int num_warps = (blockDim.x + 31) / 32;
-        sum_sq = (lane_id < num_warps) ? shared[lane_id] : 0.0f;
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
-        }
-        if (lane_id == 0) shared[0] = rsqrtf(sum_sq / dim + eps);
-    }
-    __syncthreads();
-    float inv_rms = shared[0];
-
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-        output[i] = residual[i] * inv_rms * norm_weight[i];
+        output[i]   = val;   // hidden = residual (unnormed); layer start norms it
     }
 }
 
@@ -203,8 +176,7 @@ void fused_moe_combine_norm(
     int dim, int num_active, float eps, cudaStream_t stream
 ) {
     int threads = (dim < 1024) ? dim : 1024;
-    int shared_mem = 32 * sizeof(float);
-    fused_moe_combine_norm_kernel<<<1, threads, shared_mem, stream>>>(
+    fused_moe_combine_norm_kernel<<<1, threads, 0, stream>>>(
         output, residual, expert_outputs, routing_weights,
         shared_expert, shared_weight, norm_weight,
         dim, num_active, eps

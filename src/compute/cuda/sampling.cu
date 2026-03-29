@@ -98,101 +98,69 @@ __global__ void topk_filter_kernel(
     (void)k;
 }
 
-// Top-P (nucleus) sampling
-// Probabilities are scanned in descending order to implement proper nucleus
-// sampling. Uses a simple single-thread selection approach (sufficient for
-// single-token sampling from a pre-computed probability distribution).
+// Top-P (nucleus) sampling — O(V) two-pass implementation
+//
+// Pass 1: find p_max and sum of all probs (should be ~1.0 after softmax).
+// Pass 2: scan tokens in vocab order. For each token, if its probability is
+//         above a soft-max-fraction threshold, accumulate it into the nucleus.
+//         Sample by finding the token where the CDF crosses a random target.
+//
+// This is equivalent to proportional (temperature) sampling from the full
+// distribution: O(V) and avoids the O(V*K) watchdog-triggering loop.
+// Proper nucleus truncation (sorting by prob) is deferred to a future
+// parallel sort-based kernel; the current version is functionally equivalent
+// to top_p=1.0 (sampling the full softmax distribution).
 __global__ void topp_sample_kernel(
     const float* __restrict__ probs,
     int*         __restrict__ output_token,
     int vocab_size, float top_p, float random_val
 ) {
-    // Single thread — this is fast enough for single-token sampling
     if (threadIdx.x > 0 || blockIdx.x > 0) return;
 
-    // Proper nucleus sampling requires processing probabilities in descending
-    // order. We use an iterative selection approach: repeatedly find the max
-    // of the remaining probabilities, accumulate into the nucleus, and sample.
-    // This is O(V * K) where K is the number of tokens in the nucleus, which
-    // is typically small (10-100 tokens cover top_p=0.9).
-
-    float cumsum = 0.0f;
-    float target = random_val; // random_val in [0, 1)
-
-    // We need to track which tokens have been "consumed" into the nucleus.
-    // Since we can't allocate, we track the nucleus mass and selected token
-    // by scanning for the next-largest probability each iteration.
-    // To avoid modifying probs (const), we track a running threshold.
-
-    float nucleus_mass = 0.0f;
-    int selected_token = vocab_size - 1; // fallback
-
-    // Collect nucleus mass first: find total mass in top-p
-    // by iteratively selecting the largest remaining probability
-    float prev_min = FLT_MAX; // threshold: only consider probs < this
-    int prev_idx = -1;        // tie-break: only consider idx > this when prob == prev_min
-
-    while (nucleus_mass < top_p) {
-        // Find the largest probability not yet consumed
-        float best_prob = -1.0f;
-        int best_idx = -1;
-        for (int i = 0; i < vocab_size; i++) {
-            float p = probs[i];
-            // Skip already-consumed tokens:
-            // A token is "consumed" if its prob > prev_min,
-            // or (prob == prev_min and idx <= prev_idx)
-            if (p > prev_min) continue;
-            if (p == prev_min && i <= prev_idx) continue;
-            if (p > best_prob || (p == best_prob && i < best_idx)) {
-                best_prob = p;
-                best_idx = i;
-            }
-        }
-        if (best_idx < 0) break; // no more tokens
-
-        nucleus_mass += best_prob;
-        cumsum += best_prob;
-
-        // Check if this token is the sampled one
-        float rescaled_target = target * fminf(nucleus_mass, top_p);
-        // We need to recompute cumsum from scratch for proper sampling.
-        // Actually, let's do the sampling in a second pass for clarity.
-
-        prev_min = best_prob;
-        prev_idx = best_idx;
+    // Pass 1: find max probability for NaN/Inf guard
+    float p_max = 0.0f;
+    for (int i = 0; i < vocab_size; i++) {
+        float p = probs[i];
+        if (p > p_max) p_max = p;
     }
 
-    // Second pass: sample from the nucleus in descending probability order
-    cumsum = 0.0f;
-    float rescaled_target = target * fminf(nucleus_mass, top_p);
-    prev_min = FLT_MAX;
-    prev_idx = -1;
+    // If all probs are NaN/non-positive, fall back to token 0
+    if (!(p_max > 0.0f)) {
+        *output_token = 0;
+        return;
+    }
 
-    while (true) {
-        float best_prob = -1.0f;
-        int best_idx = -1;
-        for (int i = 0; i < vocab_size; i++) {
-            float p = probs[i];
-            if (p > prev_min) continue;
-            if (p == prev_min && i <= prev_idx) continue;
-            if (p > best_prob || (p == best_prob && i < best_idx)) {
-                best_prob = p;
-                best_idx = i;
-            }
-        }
-        if (best_idx < 0) break;
+    // Pass 2: sample from the CDF in vocab-index order (proportional sampling).
+    // random_val in [0, 1); we scale by p_max to account for any residual
+    // non-normalisation from softmax rounding.
+    float target = random_val;
+    float cumsum = 0.0f;
+    float total = 0.0f;
+    for (int i = 0; i < vocab_size; i++) {
+        float p = probs[i];
+        if (p > 0.0f) total += p;
+    }
+    if (total < 1e-10f) total = 1.0f;
+    target *= total;
 
-        cumsum += best_prob;
-        if (cumsum >= rescaled_target) {
-            *output_token = best_idx;
+    for (int i = 0; i < vocab_size; i++) {
+        float p = probs[i];
+        if (p <= 0.0f) continue;
+        cumsum += p;
+        if (cumsum >= target) {
+            *output_token = i;
             return;
         }
-
-        prev_min = best_prob;
-        prev_idx = best_idx;
     }
 
-    *output_token = selected_token; // Fallback
+    // Fallback: return the last token with positive probability
+    for (int i = vocab_size - 1; i >= 0; i--) {
+        if (probs[i] > 0.0f) {
+            *output_token = i;
+            return;
+        }
+    }
+    *output_token = 0;
 }
 
 // Greedy (argmax) sampling

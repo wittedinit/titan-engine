@@ -121,18 +121,17 @@ bool InferenceEngine::load_model(const std::string& model_path) {
         return false;
     }
 
-    // Initialize the executor's KV cache so attention layers can use it
+    // KV cache is initialized inside each executor's initialize() method,
+    // with the correct head_dim for the model type (e.g., nope_head_dim for MLA).
+    // DenseExecutor's KV cache is the exception — initialize it here since
+    // DenseExecutor::initialize() doesn't do it internally.
     auto* dense = dynamic_cast<DenseExecutor*>(model_.get());
-    auto* moe = dynamic_cast<MoEExecutor*>(model_.get());
     if (dense) {
         dense->kv_cache().initialize(
             mc.num_layers, mc.num_kv_heads, mc.head_dim,
             config_.max_context_len);
-    } else if (moe) {
-        moe->kv_cache().initialize(
-            mc.num_layers, mc.num_kv_heads, mc.head_dim,
-            config_.max_context_len);
     }
+    // MoEExecutor already initialized its KV cache (with correct nope_head_dim for MLA)
 
     LOG_INFO("Model loaded: %s (%.1fB params, %.1fB active/token)",
              mc.name.c_str(),
@@ -209,14 +208,39 @@ void InferenceEngine::generate(const std::string& prompt,
         // Compute logits from final hidden state
         model_->compute_logits(hidden, logits, nullptr);
 
+        // Sync and check for CUDA errors before sampling (first token only)
+        if (step == 0) {
+            cudaError_t err = cudaDeviceSynchronize();
+            if (err != cudaSuccess) {
+                LOG_ERROR("CUDA error before sampling step 0: %s", cudaGetErrorString(err));
+            }
+            // Log first few logit values for diagnostics
+            float logit_sample[4] = {};
+            cudaMemcpy(logit_sample, logits, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+            LOG_DEBUG("logits[0..3] = %.4f %.4f %.4f %.4f",
+                      logit_sample[0], logit_sample[1], logit_sample[2], logit_sample[3]);
+        }
+
         // Sample next token
         cuda::sample_token(logits, sampled_token_gpu, cfg.vocab_size,
                           sampling.temperature, sampling.top_p, sampling.top_k,
                           rng_state++, nullptr);
 
+        // Sync and check for CUDA errors after sampling (first token only)
+        if (step == 0) {
+            cudaError_t err = cudaDeviceSynchronize();
+            if (err != cudaSuccess) {
+                LOG_ERROR("CUDA error after sampling step 0: %s", cudaGetErrorString(err));
+            }
+        }
+
         // Copy token ID to CPU
-        int token_id;
-        cudaMemcpy(&token_id, sampled_token_gpu, sizeof(int), cudaMemcpyDeviceToHost);
+        int token_id = -1;
+        cudaError_t memcpy_err = cudaMemcpy(&token_id, sampled_token_gpu, sizeof(int), cudaMemcpyDeviceToHost);
+        if (memcpy_err != cudaSuccess) {
+            LOG_ERROR("cudaMemcpy failed for token_id at step %u: %s", step, cudaGetErrorString(memcpy_err));
+            break;
+        }
 
         // Check for EOS
         if (token_id == tokenizer_.eos_id()) {
@@ -228,6 +252,7 @@ void InferenceEngine::generate(const std::string& prompt,
 
         // Decode and callback
         std::string text = tokenizer_.decode(token_id);
+        LOG_DEBUG("tok[%d] id=%d text='%s'", tokens_generated, token_id, text.c_str());
         if (on_token) {
             on_token(token_id, text);
         }

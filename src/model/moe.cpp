@@ -17,7 +17,6 @@ MoEExecutor::~MoEExecutor() {
 
     // Free model weight allocations
     if (embedding_) { cudaFree(embedding_); embedding_ = nullptr; }
-    // Only free lm_head_ if it's a separate allocation (not tied to embedding_)
     if (lm_head_ && lm_head_ != embedding_) { cudaFree(lm_head_); }
     lm_head_ = nullptr;
     if (final_norm_) { cudaFree(final_norm_); final_norm_ = nullptr; }
@@ -83,9 +82,16 @@ void MoEExecutor::allocate_buffers() {
     cudaMalloc(&expert_outputs_, k * hd * sizeof(float));
     cudaMalloc(&shared_out_, hd * sizeof(float));
 
-    // Pre-allocate expert weight staging buffers
-    // Each expert has 3 matrices: gate[moe_inter, hd] + up[moe_inter, hd] + down[hd, moe_inter]
-    expert_weight_buf_size_ = 3 * (size_t)moe_inter * hd * sizeof(float);
+    // Pre-allocate expert weight staging buffers.
+    // Size depends on format: FP32 (3×moe_inter×hd×4) or NVFP4 (packed U8 + F8 scales).
+    // NVFP4 sizes are set later in initialize() once has_nvfp4_ is known; fall back to FP32.
+    if (has_nvfp4_ && nvfp4_gate_w_bytes_ > 0) {
+        expert_weight_buf_size_ = nvfp4_gate_w_bytes_ + nvfp4_gate_s_bytes_ + sizeof(float)
+                                + nvfp4_up_w_bytes_   + nvfp4_up_s_bytes_   + sizeof(float)
+                                + nvfp4_down_w_bytes_ + nvfp4_down_s_bytes_ + sizeof(float);
+    } else {
+        expert_weight_buf_size_ = 3 * (size_t)moe_inter * hd * sizeof(float);
+    }
     cudaMalloc(&expert_weight_buf_[0], expert_weight_buf_size_);
     cudaMalloc(&expert_weight_buf_[1], expert_weight_buf_size_);
 
@@ -110,6 +116,7 @@ void MoEExecutor::free_buffers() {
     sf(shared_gate_out_); sf(shared_up_out_);
     sf(c_q_buf_); sf(c_kv_buf_); sf(kv_expanded_);
     sf(k_nope_buf_); sf(v_mla_buf_); sf(k_full_buf_); sf(q_nope_buf_);
+    if (nvfp4_load_buf_) { cudaFreeHost(nvfp4_load_buf_); nvfp4_load_buf_ = nullptr; }
 }
 
 // ============================================================================
@@ -157,8 +164,9 @@ bool MoEExecutor::initialize(const std::string& model_path,
             return false;
     }
 
-    ModelLoader loader;
-    if (!loader.load(model_path)) return false;
+    loader_ = std::make_unique<ModelLoader>();
+    if (!loader_->load(model_path)) return false;
+    ModelLoader& loader = *loader_;  // alias for the rest of init
 
     uint32_t hd = config_.hidden_dim;
     uint32_t qkv = config_.num_attn_heads * config_.head_dim;
@@ -166,53 +174,79 @@ bool MoEExecutor::initialize(const std::string& model_path,
     uint32_t vocab = config_.vocab_size;
     uint32_t moe_inter = config_.moe_intermediate_dim;
 
-    // Embedding — handle FP16/BF16 conversion to FP32
-    cudaMalloc(&embedding_, vocab * hd * sizeof(float));
-    cudaMemset(embedding_, 0, vocab * hd * sizeof(float));
-    if (loader.has_tensor("model.embed_tokens.weight")) {
-        auto emb_meta = loader.get_meta("model.embed_tokens.weight");
-        bool emb_needs_convert = (emb_meta.dtype == DType::FP16 || emb_meta.dtype == DType::BF16);
-        if (emb_needs_convert) {
-            size_t num_elem = emb_meta.numel();
-            size_t raw_bytes = emb_meta.byte_size();
-            std::vector<uint16_t> fp16_data(num_elem);
-            loader.read_tensor_cpu("model.embed_tokens.weight", fp16_data.data(), raw_bytes);
-            std::vector<float> fp32_data(num_elem);
-            for (size_t i = 0; i < num_elem; i++) {
-                uint16_t h = fp16_data[i];
-                uint32_t sign = (h >> 15) & 1;
-                uint32_t exp_bits = (h >> 10) & 0x1F;
-                uint32_t mant = h & 0x3FF;
-                uint32_t f;
-                if (exp_bits == 0) {
-                    if (mant == 0) { f = sign << 31; }
-                    else { exp_bits = 1; while (!(mant & 0x400)) { mant <<= 1; exp_bits--; } mant &= 0x3FF; f = (sign << 31) | ((exp_bits + 127 - 15) << 23) | (mant << 13); }
-                } else if (exp_bits == 31) { f = (sign << 31) | 0x7F800000 | (mant << 13); }
-                else { f = (sign << 31) | ((exp_bits + 127 - 15) << 23) | (mant << 13); }
-                memcpy(&fp32_data[i], &f, 4);
-            }
-            cudaMemcpy(embedding_, fp32_data.data(), num_elem * sizeof(float), cudaMemcpyHostToDevice);
-        } else {
-            loader.read_tensor_gpu("model.embed_tokens.weight", embedding_, emb_meta.byte_size());
-        }
+    // Detect NVFP4 format: U8-packed experts mean shared expert can't use FP32 path
+    bool has_nvfp4 = loader.has_tensor("model.layers.1.mlp.experts.0.gate_proj.weight") &&
+                     loader.get_meta("model.layers.1.mlp.experts.0.gate_proj.weight").dtype == DType::INT8;
+    has_nvfp4_ = has_nvfp4;
+
+    if (has_nvfp4_) {
+        // gate/up: [moe_inter, hd/2] U8, scale: [moe_inter, hd/16] F8
+        // down:    [hd, moe_inter/2] U8, scale: [hd, moe_inter/16] F8
+        nvfp4_gate_w_bytes_ = (size_t)moe_inter * (hd / 2);
+        nvfp4_gate_s_bytes_ = (size_t)moe_inter * (hd / 16);
+        nvfp4_up_w_bytes_   = nvfp4_gate_w_bytes_;
+        nvfp4_up_s_bytes_   = nvfp4_gate_s_bytes_;
+        nvfp4_down_w_bytes_ = (size_t)hd * (moe_inter / 2);
+        nvfp4_down_s_bytes_ = (size_t)hd * (moe_inter / 16);
+        expert_bytes_ = nvfp4_gate_w_bytes_ + nvfp4_gate_s_bytes_ + sizeof(float)
+                      + nvfp4_up_w_bytes_   + nvfp4_up_s_bytes_   + sizeof(float)
+                      + nvfp4_down_w_bytes_ + nvfp4_down_s_bytes_ + sizeof(float);
+        // Pinned host buffer for loading one expert from safetensors
+        cudaMallocHost(&nvfp4_load_buf_, expert_bytes_);
+    } else {
+        expert_bytes_ = 3 * (size_t)moe_inter * hd * sizeof(float);
     }
 
-    // Final norm
+    // Embedding — store as BF16 if available (saves ~2.35 GB vs FP32 for vocab=163K, hidden=7168)
+    if (loader.has_tensor("model.embed_tokens.weight")) {
+        auto emb_meta = loader.get_meta("model.embed_tokens.weight");
+        embedding_is_bf16_ = (emb_meta.dtype == DType::BF16 || emb_meta.dtype == DType::FP16);
+        size_t emb_alloc = (size_t)vocab * hd * (embedding_is_bf16_ ? sizeof(uint16_t) : sizeof(float));
+        cudaMalloc(&embedding_, emb_alloc);
+        cudaMemset(embedding_, 0, emb_alloc);
+        loader.read_tensor_gpu("model.embed_tokens.weight", embedding_, emb_meta.byte_size());
+    } else {
+        embedding_is_bf16_ = false;
+        cudaMalloc(&embedding_, (size_t)vocab * hd * sizeof(float));
+        cudaMemset(embedding_, 0, (size_t)vocab * hd * sizeof(float));
+    }
+
+    // Final norm — always FP32 (tiny vector, used by rmsnorm kernel)
     cudaMalloc(&final_norm_, hd * sizeof(float));
     std::vector<float> ones(hd, 1.0f);
     cudaMemcpy(final_norm_, ones.data(), hd * sizeof(float), cudaMemcpyHostToDevice);
     if (loader.has_tensor("model.norm.weight")) {
-        loader.read_tensor_gpu("model.norm.weight", final_norm_,
-                                loader.get_meta("model.norm.weight").byte_size());
+        // norm.weight is BF16 on disk; convert to FP32 for the rmsnorm kernel
+        auto nm_meta = loader.get_meta("model.norm.weight");
+        if (nm_meta.dtype == DType::BF16 || nm_meta.dtype == DType::FP16) {
+            std::vector<uint16_t> raw(nm_meta.numel());
+            loader.read_tensor_cpu("model.norm.weight", raw.data(), nm_meta.byte_size());
+            std::vector<float> fp32(nm_meta.numel());
+            for (size_t i = 0; i < (size_t)nm_meta.numel(); i++) {
+                uint32_t v = (nm_meta.dtype == DType::BF16)
+                             ? ((uint32_t)raw[i] << 16)
+                             : [&]() -> uint32_t {
+                                 uint16_t h=raw[i]; uint32_t s=(h>>15)&1,e=(h>>10)&0x1F,m=h&0x3FF;
+                                 if (!e) return (s<<31)|(m?(uint32_t)((127-15)<<23)|(m<<13):0u);
+                                 if (e==31) return (s<<31)|0x7F800000|(m<<13);
+                                 return (s<<31)|((e+127-15)<<23)|(m<<13);
+                               }();
+                memcpy(&fp32[i], &v, 4);
+            }
+            cudaMemcpy(final_norm_, fp32.data(), nm_meta.numel() * sizeof(float), cudaMemcpyHostToDevice);
+        } else {
+            loader.read_tensor_gpu("model.norm.weight", final_norm_, nm_meta.byte_size());
+        }
     }
 
-    // LM head
+    // LM head — same format as embedding (tied weights if no separate lm_head.weight)
     if (loader.has_tensor("lm_head.weight")) {
-        cudaMalloc(&lm_head_, vocab * hd * sizeof(float));
-        loader.read_tensor_gpu("lm_head.weight", lm_head_,
-                                loader.get_meta("lm_head.weight").byte_size());
+        auto lm_meta = loader.get_meta("lm_head.weight");
+        size_t lm_alloc = (size_t)vocab * hd * (embedding_is_bf16_ ? sizeof(uint16_t) : sizeof(float));
+        cudaMalloc(&lm_head_, lm_alloc);
+        loader.read_tensor_gpu("lm_head.weight", lm_head_, lm_meta.byte_size());
     } else {
-        lm_head_ = embedding_;
+        lm_head_ = embedding_; // Tied weights
     }
 
     // Per-layer
@@ -243,11 +277,12 @@ bool MoEExecutor::initialize(const std::string& model_path,
         // to avoid wasting ~400MB × 3 per layer (73 GB for a 61-layer model).
         if (config_.has_mla) {
             // o_proj for MLA: [hidden, n_heads * v_head_dim] = [7168, 8192] per layer
+            // Stored in BF16 to save VRAM (117 MB → 58 MB per layer).
             uint32_t o_in_mla = config_.num_attn_heads * (config_.v_head_dim > 0
                                   ? config_.v_head_dim : (config_.nope_head_dim > 0
                                     ? config_.nope_head_dim : config_.head_dim));
-            cudaMalloc(&aw.o_proj, hd * o_in_mla * sizeof(float));
-            cudaMemset(aw.o_proj, 0, hd * o_in_mla * sizeof(float));
+            cudaMalloc(&aw.o_proj, hd * o_in_mla * sizeof(uint16_t));
+            cudaMemset(aw.o_proj, 0, hd * o_in_mla * sizeof(uint16_t));
         } else {
             cudaMalloc(&aw.q_proj, qkv * hd * sizeof(float));
             cudaMalloc(&aw.k_proj, kv * hd * sizeof(float));
@@ -260,9 +295,9 @@ bool MoEExecutor::initialize(const std::string& model_path,
         }
 
         if (config_.has_mla) {
-            // MLA (Multi-head Latent Attention): load raw A/B projection matrices.
-            // Q:  hidden -> q_a_proj -> LayerNorm -> q_b_proj -> Q heads
-            // KV: hidden -> kv_a_proj -> LayerNorm -> kv_b_proj -> K/V heads
+            // MLA (Multi-head Latent Attention): load projection matrices in BF16 to save VRAM.
+            // BF16 storage halves memory: 25 GB → 12.5 GB for 61-layer model.
+            // Forward pass uses gemv_bf16_to_fp32 (cuBLAS GemmEx) for full-precision math.
             uint32_t q_lr  = config_.q_lora_rank  > 0 ? config_.q_lora_rank  : 1536;
             uint32_t kv_lr = config_.kv_lora_rank > 0 ? config_.kv_lora_rank :  512;
             uint32_t nope_hd = config_.nope_head_dim > 0 ? config_.nope_head_dim : 128;
@@ -271,25 +306,36 @@ bool MoEExecutor::initialize(const std::string& model_path,
             uint32_t kv_a_rows = kv_lr + rope_hd;
             uint32_t kv_b_rows = config_.num_kv_heads * (nope_hd + v_hd);
 
-            // Allocate and load each MLA projection directly (no CPU matmul)
-            cudaMalloc(&aw.q_a_proj,  (size_t)q_lr * hd * sizeof(float));
-            cudaMalloc(&aw.q_b_proj,  (size_t)qkv  * q_lr * sizeof(float));
+            // Allocate BF16 projection matrices (2 bytes/elem instead of 4)
+            cudaMalloc(&aw.q_a_proj,  (size_t)q_lr * hd * sizeof(uint16_t));
+            cudaMalloc(&aw.q_b_proj,  (size_t)qkv  * q_lr * sizeof(uint16_t));
             cudaMalloc(&aw.q_a_norm,  q_lr * sizeof(float));
-            cudaMalloc(&aw.kv_a_proj, (size_t)kv_a_rows * hd * sizeof(float));
-            cudaMalloc(&aw.kv_b_proj, (size_t)kv_b_rows * kv_lr * sizeof(float));
+            cudaMalloc(&aw.kv_a_proj, (size_t)kv_a_rows * hd * sizeof(uint16_t));
+            cudaMalloc(&aw.kv_b_proj, (size_t)kv_b_rows * kv_lr * sizeof(uint16_t));
             cudaMalloc(&aw.kv_a_norm, kv_lr * sizeof(float));
-            cudaMemset(aw.q_a_proj,  0, (size_t)q_lr * hd * sizeof(float));
-            cudaMemset(aw.q_b_proj,  0, (size_t)qkv  * q_lr * sizeof(float));
+            cudaMemset(aw.q_a_proj,  0, (size_t)q_lr * hd * sizeof(uint16_t));
+            cudaMemset(aw.q_b_proj,  0, (size_t)qkv  * q_lr * sizeof(uint16_t));
+            // Norm weights stay FP32 (tiny vectors, used by rmsnorm kernel)
             std::fill(ones.begin(), ones.end(), 1.0f);
             if ((uint32_t)ones.size() >= q_lr)
                 cudaMemcpy(aw.q_a_norm, ones.data(), q_lr * sizeof(float), cudaMemcpyHostToDevice);
-            cudaMemset(aw.kv_a_proj, 0, (size_t)kv_a_rows * hd * sizeof(float));
-            cudaMemset(aw.kv_b_proj, 0, (size_t)kv_b_rows * kv_lr * sizeof(float));
+            cudaMemset(aw.kv_a_proj, 0, (size_t)kv_a_rows * hd * sizeof(uint16_t));
+            cudaMemset(aw.kv_b_proj, 0, (size_t)kv_b_rows * kv_lr * sizeof(uint16_t));
             if ((uint32_t)ones.size() >= kv_lr)
                 cudaMemcpy(aw.kv_a_norm, ones.data(), kv_lr * sizeof(float), cudaMemcpyHostToDevice);
 
-            // Helper to load BF16 tensor from disk into pre-allocated FP32 GPU buffer
-            auto load_bf16_to_fp32_gpu = [&](const std::string& name, float* dst_fp32, size_t n_elems) {
+            // Helper to load BF16/FP16 tensor from disk directly as BF16 into GPU buffer
+            // (no FP32 expansion — kept BF16 to save VRAM)
+            auto load_bf16_gpu = [&](const std::string& name, void* dst_bf16, size_t max_elems) {
+                if (!loader.has_tensor(name)) return;
+                auto meta = loader.get_meta(name);
+                if ((size_t)meta.numel() > max_elems) return;
+                if (meta.dtype != DType::BF16 && meta.dtype != DType::FP16) return;
+                loader.read_tensor_gpu(name, dst_bf16, meta.byte_size());
+            };
+
+            // Helper to load norm weights as FP32 (BF16 on disk → FP32 on GPU)
+            auto load_norm_fp32 = [&](const std::string& name, float* dst_fp32, size_t n_elems) {
                 if (!loader.has_tensor(name)) return;
                 auto meta = loader.get_meta(name);
                 if ((size_t)meta.numel() > n_elems) return;
@@ -298,27 +344,25 @@ bool MoEExecutor::initialize(const std::string& model_path,
                 std::vector<float> fp32(meta.numel());
                 bool is_bf16 = (meta.dtype == DType::BF16);
                 for (size_t i = 0; i < (size_t)meta.numel(); i++) {
-                    uint32_t v;
-                    if (is_bf16) {
-                        v = (uint32_t)raw[i] << 16;
-                    } else { // FP16
-                        uint16_t h = raw[i];
-                        uint32_t s=(h>>15)&1, e=(h>>10)&0x1F, m=h&0x3FF;
-                        if (e==0) v=(s<<31)|((m==0)?0u:(uint32_t)((127-15)<<23)|(m<<13));
-                        else if (e==31) v=(s<<31)|0x7F800000|(m<<13);
-                        else v=(s<<31)|((e+127-15)<<23)|(m<<13);
-                    }
+                    uint16_t h = raw[i];
+                    uint32_t v = is_bf16 ? ((uint32_t)h << 16)
+                                         : [&]() -> uint32_t {
+                                             uint32_t s=(h>>15)&1, e=(h>>10)&0x1F, m=h&0x3FF;
+                                             if (e==0) return (s<<31)|((m==0)?0u:(uint32_t)((127-15)<<23)|(m<<13));
+                                             if (e==31) return (s<<31)|0x7F800000|(m<<13);
+                                             return (s<<31)|((e+127-15)<<23)|(m<<13);
+                                           }();
                     memcpy(&fp32[i], &v, 4);
                 }
                 cudaMemcpy(dst_fp32, fp32.data(), meta.numel() * sizeof(float), cudaMemcpyHostToDevice);
             };
 
-            load_bf16_to_fp32_gpu(lp + ".self_attn.q_a_proj.weight",          aw.q_a_proj,  (size_t)q_lr * hd);
-            load_bf16_to_fp32_gpu(lp + ".self_attn.q_b_proj.weight",          aw.q_b_proj,  (size_t)qkv * q_lr);
-            load_bf16_to_fp32_gpu(lp + ".self_attn.q_a_layernorm.weight",     aw.q_a_norm,  q_lr);
-            load_bf16_to_fp32_gpu(lp + ".self_attn.kv_a_proj_with_mqa.weight",aw.kv_a_proj, (size_t)kv_a_rows * hd);
-            load_bf16_to_fp32_gpu(lp + ".self_attn.kv_b_proj.weight",         aw.kv_b_proj, (size_t)kv_b_rows * kv_lr);
-            load_bf16_to_fp32_gpu(lp + ".self_attn.kv_a_layernorm.weight",    aw.kv_a_norm, kv_lr);
+            load_bf16_gpu(lp + ".self_attn.q_a_proj.weight",           aw.q_a_proj,  (size_t)q_lr * hd);
+            load_bf16_gpu(lp + ".self_attn.q_b_proj.weight",           aw.q_b_proj,  (size_t)qkv * q_lr);
+            load_norm_fp32(lp + ".self_attn.q_a_layernorm.weight",     aw.q_a_norm,  q_lr);
+            load_bf16_gpu(lp + ".self_attn.kv_a_proj_with_mqa.weight", aw.kv_a_proj, (size_t)kv_a_rows * hd);
+            load_bf16_gpu(lp + ".self_attn.kv_b_proj.weight",          aw.kv_b_proj, (size_t)kv_b_rows * kv_lr);
+            load_norm_fp32(lp + ".self_attn.kv_a_layernorm.weight",    aw.kv_a_norm, kv_lr);
         } else {
             try_load(lp + ".self_attn.q_proj.weight", aw.q_proj, qkv * hd * sizeof(float));
             try_load(lp + ".self_attn.k_proj.weight", aw.k_proj, kv * hd * sizeof(float));
@@ -335,17 +379,30 @@ bool MoEExecutor::initialize(const std::string& model_path,
         cudaMemset(ms.gate_weight, 0, config_.num_experts * hd * sizeof(float));
         try_load(lp + ".mlp.gate.weight", ms.gate_weight, config_.num_experts * hd * sizeof(float));
 
-        // Shared expert
-        if (config_.num_shared_experts > 0) {
+        // Shared expert — only allocate FP32 buffers for non-NVFP4 models.
+        // NVFP4 shared experts (mlp.shared_experts.*) are U8 format and can't
+        // be directly used with the FP32 gemv path. Leave nullptr to skip the
+        // shared expert in forward_layer() (fused_moe_combine_norm handles nullptr).
+        if (config_.num_shared_experts > 0 && !has_nvfp4) {
             cudaMalloc(&ms.shared_gate_proj, moe_inter * hd * sizeof(float));
             cudaMalloc(&ms.shared_up_proj, moe_inter * hd * sizeof(float));
             cudaMalloc(&ms.shared_down_proj, hd * moe_inter * sizeof(float));
             cudaMemset(ms.shared_gate_proj, 0, moe_inter * hd * sizeof(float));
             cudaMemset(ms.shared_up_proj, 0, moe_inter * hd * sizeof(float));
             cudaMemset(ms.shared_down_proj, 0, hd * moe_inter * sizeof(float));
-            try_load(lp + ".mlp.shared_expert.gate_proj.weight", ms.shared_gate_proj, 0);
-            try_load(lp + ".mlp.shared_expert.up_proj.weight", ms.shared_up_proj, 0);
-            try_load(lp + ".mlp.shared_expert.down_proj.weight", ms.shared_down_proj, 0);
+            // Try both singular and plural naming conventions
+            if (!loader.has_tensor(lp + ".mlp.shared_expert.gate_proj.weight"))
+                try_load(lp + ".mlp.shared_experts.gate_proj.weight", ms.shared_gate_proj, 0);
+            else
+                try_load(lp + ".mlp.shared_expert.gate_proj.weight", ms.shared_gate_proj, 0);
+            if (!loader.has_tensor(lp + ".mlp.shared_expert.up_proj.weight"))
+                try_load(lp + ".mlp.shared_experts.up_proj.weight", ms.shared_up_proj, 0);
+            else
+                try_load(lp + ".mlp.shared_expert.up_proj.weight", ms.shared_up_proj, 0);
+            if (!loader.has_tensor(lp + ".mlp.shared_expert.down_proj.weight"))
+                try_load(lp + ".mlp.shared_experts.down_proj.weight", ms.shared_down_proj, 0);
+            else
+                try_load(lp + ".mlp.shared_expert.down_proj.weight", ms.shared_down_proj, 0);
         }
 
         if ((l + 1) % 10 == 0 || l == config_.num_layers - 1)
@@ -353,7 +410,7 @@ bool MoEExecutor::initialize(const std::string& model_path,
     }
 
     expert_dir_ = model_path;
-    expert_bytes_ = 3 * (size_t)moe_inter * hd * sizeof(float);
+    // expert_bytes_ already set above (NVFP4 or FP32 layout)
 
     allocate_buffers();
 
@@ -364,11 +421,137 @@ bool MoEExecutor::initialize(const std::string& model_path,
     return true;
 }
 
+// ============================================================================
+// NVFP4 On-Demand Expert Loading
+//
+// Reads gate/up/down weight + F8 scale + F32 global scale from the ModelLoader
+// (safetensors on disk) directly into a pre-allocated GPU staging buffer.
+// Layout in gpu_buf: [gate_w | gate_s | gate_g | up_w | up_s | up_g | down_w | down_s | down_g]
+// where _w = U8 weights, _s = F8 scales, _g = F32 global (weight_scale_2)
+// ============================================================================
+
+bool MoEExecutor::load_nvfp4_expert(uint32_t layer_id, uint32_t expert_id,
+                                     void* gpu_buf, cudaStream_t stream) {
+    if (!loader_ || !nvfp4_load_buf_) return false;
+
+    std::string base = "model.layers." + std::to_string(layer_id)
+                     + ".mlp.experts." + std::to_string(expert_id);
+
+    // First call: log tensor metadata for diagnostics
+    static bool logged_shapes = false;
+    if (!logged_shapes && layer_id == 0 && expert_id == 0) {
+        logged_shapes = true;
+        auto log_tensor = [&](const std::string& suffix) {
+            std::string name = base + suffix;
+            if (loader_->has_tensor(name)) {
+                auto m = loader_->get_meta(name);
+                std::string shape_str;
+                for (size_t di = 0; di < m.shape.size(); di++) {
+                    if (di) shape_str += "x";
+                    shape_str += std::to_string(m.shape[di]);
+                }
+                LOG_DEBUG("  %s: dtype=%s shape=[%s] bytes=%zu",
+                          suffix.c_str(), m.dtype_str.c_str(), shape_str.c_str(), m.byte_size());
+            } else {
+                LOG_DEBUG("  %s: NOT FOUND", suffix.c_str());
+            }
+        };
+        LOG_DEBUG("NVFP4 expert tensor shapes for %s:", base.c_str());
+        log_tensor(".gate_proj.weight");
+        log_tensor(".gate_proj.weight_scale");
+        log_tensor(".gate_proj.weight_scale_2");
+        log_tensor(".gate_proj.input_scale");
+        log_tensor(".up_proj.weight");
+        log_tensor(".down_proj.weight");
+    }
+
+    uint8_t* cpu = (uint8_t*)nvfp4_load_buf_;
+    size_t off = 0;
+
+    // Helper: read a tensor into the pinned CPU buffer
+    auto read = [&](const std::string& name, size_t expected) -> bool {
+        if (!loader_->has_tensor(name)) {
+            LOG_ERROR("NVFP4 expert tensor not found: %s", name.c_str());
+            return false;
+        }
+        ssize_t got = loader_->read_tensor_cpu(name, cpu + off, expected);
+        if (got != (ssize_t)expected) {
+            auto meta = loader_->get_meta(name);
+            LOG_ERROR("NVFP4 tensor size mismatch: %s — expected %zu bytes, tensor has %zu bytes (dtype=%s)",
+                      name.c_str(), expected, meta.byte_size(), meta.dtype_str.c_str());
+            return false;
+        }
+        return true;
+    };
+
+    auto read_scalar = [&](const std::string& name) -> bool {
+        if (!loader_->has_tensor(name)) {
+            // Default: 1.0
+            float one = 1.0f;
+            memcpy(cpu + off, &one, sizeof(float));
+            return true;
+        }
+        auto meta = loader_->get_meta(name);
+        size_t tensor_bytes = meta.byte_size();
+        if (tensor_bytes == sizeof(float)) {
+            ssize_t got = loader_->read_tensor_cpu(name, cpu + off, sizeof(float));
+            return got == (ssize_t)sizeof(float);
+        } else if (tensor_bytes == sizeof(uint16_t)) {
+            // BF16 scalar — convert to F32
+            uint16_t bf16 = 0;
+            ssize_t got = loader_->read_tensor_cpu(name, &bf16, sizeof(uint16_t));
+            if (got != (ssize_t)sizeof(uint16_t)) return false;
+            uint32_t f32bits = (uint32_t)bf16 << 16;
+            memcpy(cpu + off, &f32bits, sizeof(float));
+            return true;
+        } else {
+            LOG_ERROR("NVFP4 scalar %s has unexpected size %zu bytes (dtype=%s) — using 1.0",
+                      name.c_str(), tensor_bytes, meta.dtype_str.c_str());
+            float one = 1.0f;
+            memcpy(cpu + off, &one, sizeof(float));
+            return true;
+        }
+    };
+
+    // gate
+    if (!read(base + ".gate_proj.weight", nvfp4_gate_w_bytes_))     return false;
+    off += nvfp4_gate_w_bytes_;
+    if (!read(base + ".gate_proj.weight_scale", nvfp4_gate_s_bytes_)) return false;
+    off += nvfp4_gate_s_bytes_;
+    if (!read_scalar(base + ".gate_proj.weight_scale_2")) return false;
+    off += sizeof(float);
+
+    // up
+    if (!read(base + ".up_proj.weight", nvfp4_up_w_bytes_))         return false;
+    off += nvfp4_up_w_bytes_;
+    if (!read(base + ".up_proj.weight_scale", nvfp4_up_s_bytes_))   return false;
+    off += nvfp4_up_s_bytes_;
+    if (!read_scalar(base + ".up_proj.weight_scale_2")) return false;
+    off += sizeof(float);
+
+    // down
+    if (!read(base + ".down_proj.weight", nvfp4_down_w_bytes_))     return false;
+    off += nvfp4_down_w_bytes_;
+    if (!read(base + ".down_proj.weight_scale", nvfp4_down_s_bytes_)) return false;
+    off += nvfp4_down_s_bytes_;
+    if (!read_scalar(base + ".down_proj.weight_scale_2")) return false;
+    off += sizeof(float);
+
+    // Transfer to GPU
+    cudaMemcpyAsync(gpu_buf, nvfp4_load_buf_, expert_bytes_,
+                     cudaMemcpyHostToDevice, stream);
+    return true;
+}
+
 void MoEExecutor::embed_token(int token_id, float* output, cudaStream_t stream) {
     if (!embedding_ || token_id < 0 || token_id >= (int)config_.vocab_size) return;
-    cudaMemcpyAsync(output, embedding_ + (size_t)token_id * config_.hidden_dim,
-                     config_.hidden_dim * sizeof(float),
-                     cudaMemcpyDeviceToDevice, stream ? stream : 0);
+    if (embedding_is_bf16_) {
+        cuda::embed_token_bf16(output, embedding_, token_id, config_.hidden_dim, stream);
+    } else {
+        cudaMemcpyAsync(output, (const float*)embedding_ + (size_t)token_id * config_.hidden_dim,
+                         config_.hidden_dim * sizeof(float),
+                         cudaMemcpyDeviceToDevice, stream ? stream : 0);
+    }
 }
 
 // ============================================================================
@@ -398,20 +581,20 @@ void MoEExecutor::forward_layer(float* hidden, float* residual,
     uint32_t kv_lr    = config_.kv_lora_rank   > 0 ? config_.kv_lora_rank   : hd;
 
     if (config_.has_mla && aw.q_a_proj) {
-        // MLA two-hop Q: hidden → q_a → RMSNorm → q_b → Q
-        cuda::gemv_fp32(aw.q_a_proj, norm_buf_, c_q_buf_, q_lr, hd, stream);
+        // MLA two-hop Q: hidden → q_a (BF16) → RMSNorm → q_b (BF16) → Q
+        cuda::gemv_bf16_to_fp32(aw.q_a_proj, norm_buf_, c_q_buf_, q_lr, hd, stream);
         cuda::rmsnorm(c_q_buf_, c_q_buf_, aw.q_a_norm, q_lr, 1e-5f, stream);
-        cuda::gemv_fp32(aw.q_b_proj, c_q_buf_, q_buf_, qkv, q_lr, stream);
+        cuda::gemv_bf16_to_fp32(aw.q_b_proj, c_q_buf_, q_buf_, qkv, q_lr, stream);
 
-        // MLA two-hop KV: hidden → kv_a → RMSNorm (on kv_lr part) → kv_b → K_nope+V
+        // MLA two-hop KV: hidden → kv_a (BF16) → RMSNorm → kv_b (BF16) → K_nope+V
         uint32_t kv_a_rows = kv_lr + rope_hd;
-        cuda::gemv_fp32(aw.kv_a_proj, norm_buf_, c_kv_buf_, kv_a_rows, hd, stream);
-        // Compress: c_kv_buf_ layout = [kv_lr elems | rope_hd elems]
-        // Apply LayerNorm only to the compressed KV portion (first kv_lr elements)
+        cuda::gemv_bf16_to_fp32(aw.kv_a_proj, norm_buf_, c_kv_buf_, kv_a_rows, hd, stream);
+        // c_kv_buf_ layout = [kv_lr elems | rope_hd elems]
+        // Apply RMSNorm only to the compressed KV portion (first kv_lr elements)
         cuda::rmsnorm(c_kv_buf_, c_kv_buf_, aw.kv_a_norm, kv_lr, 1e-5f, stream);
-        // Expand via kv_b: [n_kv_heads*(nope_hd+v_hd)] from [kv_lr]
+        // Expand: kv_b (BF16) [n_kv_heads*(nope_hd+v_hd)] from [kv_lr]
         uint32_t kv_b_rows = config_.num_kv_heads * (nope_hd + v_hd);
-        cuda::gemv_fp32(aw.kv_b_proj, c_kv_buf_, kv_expanded_, kv_b_rows, kv_lr, stream);
+        cuda::gemv_bf16_to_fp32(aw.kv_b_proj, c_kv_buf_, kv_expanded_, kv_b_rows, kv_lr, stream);
 
         // Deinterleave kv_expanded → k_nope_buf_ and v_mla_buf_
         cuda::mla_deinterleave_kv(kv_expanded_, k_nope_buf_, v_mla_buf_,
@@ -455,10 +638,10 @@ void MoEExecutor::forward_layer(float* hidden, float* residual,
                                config_.num_attn_heads, config_.num_kv_heads,
                                nope_hd, seq_len, stream);
 
-        // O proj: shape [hidden, n_heads*v_hd] = [7168, 8192]
+        // O proj (BF16): shape [hidden, n_heads*v_hd] = [7168, 8192]
         uint32_t o_in_dim = config_.num_attn_heads * v_hd;
         float* o_tmp = norm_buf_;
-        cuda::gemv_fp32((const float*)aw.o_proj, attn_out_, o_tmp, hd, o_in_dim, stream);
+        cuda::gemv_bf16_to_fp32(aw.o_proj, attn_out_, o_tmp, hd, o_in_dim, stream);
         cuda::vector_add(residual, residual, o_tmp, hd, stream);
     } else {
         // Standard GQA attention
@@ -501,27 +684,78 @@ void MoEExecutor::forward_layer(float* hidden, float* residual,
     for (int e = 0; e < k; e++) {
         int expert_id = h_indices[e];
         float* expert_out = expert_outputs_ + e * hd;
+        void* weight_buf = expert_weight_buf_[e & 1];
 
-        // Use alternating buffers for overlap potential
-        float* weight_buf = expert_weight_buf_[e & 1];
+        if (has_nvfp4_) {
+            // --- NVFP4 path ---
+            // CPU staging buffer layout (offsets in bytes):
+            //   gate_w [gate_w_sz] | gate_s [gate_s_sz] | gate_g [4]
+            //   up_w   [up_w_sz]   | up_s   [up_s_sz]   | up_g   [4]
+            //   down_w [down_w_sz] | down_s [down_s_sz] | down_g [4]
+            const uint8_t* cpu_buf = (const uint8_t*)nvfp4_load_buf_;
+            size_t gate_off = nvfp4_gate_w_bytes_ + nvfp4_gate_s_bytes_;
+            size_t up_off   = gate_off + sizeof(float) + nvfp4_up_w_bytes_ + nvfp4_up_s_bytes_;
+            size_t down_off = up_off   + sizeof(float) + nvfp4_down_w_bytes_ + nvfp4_down_s_bytes_;
 
-        void* expert_data = memory_->get_expert(layer_id, expert_id, expert_bytes_);
-        if (!expert_data) continue;
+            // Try NVMe bin file first; fall back to on-demand safetensors load
+            void* expert_data = memory_->get_expert(layer_id, expert_id, expert_bytes_);
+            bool loaded_to_gpu = false;
+            float gate_g = 1.0f, up_g = 1.0f, down_g = 1.0f;
 
-        // Copy expert weights from RAM → pre-allocated GPU buffer (single memcpy)
-        cudaMemcpyAsync(weight_buf, expert_data, expert_bytes_,
-                         cudaMemcpyHostToDevice, stream);
+            if (expert_data) {
+                // Data came from NVMe bin — read global scales from RAM buffer
+                const uint8_t* rd = (const uint8_t*)expert_data;
+                memcpy(&gate_g, rd + gate_off, sizeof(float));
+                memcpy(&up_g,   rd + up_off,   sizeof(float));
+                memcpy(&down_g, rd + down_off,  sizeof(float));
+                cudaMemcpyAsync(weight_buf, expert_data, expert_bytes_,
+                                 cudaMemcpyHostToDevice, stream);
+                loaded_to_gpu = true;
+            } else {
+                // On-demand load: fills nvfp4_load_buf_ then copies to weight_buf
+                if (!load_nvfp4_expert(layer_id, expert_id, weight_buf, stream))
+                    continue;
+                // Read global scales from CPU staging buffer (set by load_nvfp4_expert)
+                memcpy(&gate_g, cpu_buf + gate_off, sizeof(float));
+                memcpy(&up_g,   cpu_buf + up_off,   sizeof(float));
+                memcpy(&down_g, cpu_buf + down_off,  sizeof(float));
+                cudaStreamSynchronize(stream); // ensure H→D transfer done
+                loaded_to_gpu = true;
+            }
+            if (!loaded_to_gpu) continue;
 
-        // Parse weight layout within the buffer
-        float* d_gate_w = weight_buf;
-        float* d_up_w = weight_buf + (size_t)moe_inter * hd;
-        float* d_down_w = d_up_w + (size_t)moe_inter * hd;
+            // GPU buffer layout mirrors CPU layout (same offsets)
+            const uint8_t* d_gate_w = (const uint8_t*)weight_buf;
+            const uint8_t* d_gate_s = d_gate_w + nvfp4_gate_w_bytes_;
+            const uint8_t* d_up_w   = d_gate_s + nvfp4_gate_s_bytes_ + sizeof(float);
+            const uint8_t* d_up_s   = d_up_w   + nvfp4_up_w_bytes_;
+            const uint8_t* d_down_w = d_up_s   + nvfp4_up_s_bytes_   + sizeof(float);
+            const uint8_t* d_down_s = d_down_w + nvfp4_down_w_bytes_;
 
-        // Expert forward: gate → up → SwiGLU → down
-        cuda::gemv_fp32(d_gate_w, norm_buf_, expert_gate_out_, moe_inter, hd, stream);
-        cuda::gemv_fp32(d_up_w, norm_buf_, expert_up_out_, moe_inter, hd, stream);
-        cuda::swiglu(expert_gate_out_, expert_gate_out_, expert_up_out_, moe_inter, stream);
-        cuda::gemv_fp32(d_down_w, expert_gate_out_, expert_out, hd, moe_inter, stream);
+            cuda::dequant_matvec_nvfp4(d_gate_w, d_gate_s, gate_g,
+                                        norm_buf_, expert_gate_out_, moe_inter, hd, stream);
+            cuda::dequant_matvec_nvfp4(d_up_w, d_up_s, up_g,
+                                        norm_buf_, expert_up_out_, moe_inter, hd, stream);
+            cuda::swiglu(expert_gate_out_, expert_gate_out_, expert_up_out_, moe_inter, stream);
+            cuda::dequant_matvec_nvfp4(d_down_w, d_down_s, down_g,
+                                        expert_gate_out_, expert_out, hd, moe_inter, stream);
+        } else {
+            // --- FP32 path ---
+            void* expert_data = memory_->get_expert(layer_id, expert_id, expert_bytes_);
+            if (!expert_data) continue;
+
+            cudaMemcpyAsync(weight_buf, expert_data, expert_bytes_,
+                             cudaMemcpyHostToDevice, stream);
+
+            float* d_gate_w = (float*)weight_buf;
+            float* d_up_w   = d_gate_w + (size_t)moe_inter * hd;
+            float* d_down_w = d_up_w   + (size_t)moe_inter * hd;
+
+            cuda::gemv_fp32(d_gate_w, norm_buf_, expert_gate_out_, moe_inter, hd, stream);
+            cuda::gemv_fp32(d_up_w,   norm_buf_, expert_up_out_,   moe_inter, hd, stream);
+            cuda::swiglu(expert_gate_out_, expert_gate_out_, expert_up_out_, moe_inter, stream);
+            cuda::gemv_fp32(d_down_w, expert_gate_out_, expert_out, hd, moe_inter, stream);
+        }
     }
 
     // Shared expert
@@ -552,8 +786,13 @@ void MoEExecutor::compute_logits(const float* hidden, float* logits,
                                   cudaStream_t cuda_stream) {
     cudaStream_t stream = cuda_stream;
     cuda::rmsnorm(norm_buf_, hidden, final_norm_, config_.hidden_dim, 1e-5f, stream);
-    cuda::gemv_fp32((const float*)lm_head_, norm_buf_, logits,
-                    config_.vocab_size, config_.hidden_dim, stream);
+    if (embedding_is_bf16_) {
+        cuda::gemv_bf16_to_fp32(lm_head_, norm_buf_, logits,
+                                config_.vocab_size, config_.hidden_dim, stream);
+    } else {
+        cuda::gemv_fp32((const float*)lm_head_, norm_buf_, logits,
+                        config_.vocab_size, config_.hidden_dim, stream);
+    }
 }
 
 size_t MoEExecutor::attention_weight_bytes(uint32_t) const {
