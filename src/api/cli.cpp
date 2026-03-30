@@ -44,6 +44,8 @@ static void print_usage(const char* prog) {
 "  --top-k K              Top-k sampling (default: 40)\n"
 "  --max-tokens N         Max tokens to generate (default: 2048)\n"
 "  --no-prefetch          Disable expert prefetching\n"
+"  --chatml               Apply ChatML format (<|im_start|>/<|im_end|>) for instruct models\n"
+"  --system PROMPT        System prompt to use with --chatml (default: none)\n"
 "  --serve                Start as HTTP API server (OpenAI-compatible)\n"
 "  --host HOST            Server bind address (default: 0.0.0.0)\n"
 "  --port PORT            Server port (default: 8080)\n"
@@ -53,7 +55,7 @@ static void print_usage(const char* prog) {
 "Examples:\n"
 "  %s -m ./llama-8b -q q4_k\n"
 "  %s -m ./deepseek-v3 -q int4 --vram 28000\n"
-"  %s -m ./kimi-k2.5 -q q3_k --max-tokens 4096\n\n"
+"  %s -m ./kimi-k2.5-nvfp4 --chatml --system \"You are Kimi, an AI assistant made by Moonshot AI.\"\n\n"
 "Server mode:\n"
 "  %s -m ./llama-8b -q q4_k --serve --port 8080\n\n"
 "  Then use with any OpenAI client:\n"
@@ -74,6 +76,8 @@ int main(int argc, char** argv) {
     SamplingParams sampling;
     bool verbose = false;
     bool serve_mode = false;
+    bool use_chatml = false;
+    std::string system_prompt;
     std::string serve_host = "0.0.0.0";
     int serve_port = 8080;
 
@@ -113,6 +117,8 @@ int main(int argc, char** argv) {
         else if (arg == "--serve") serve_mode = true;
         else if (arg == "--host") serve_host = next();
         else if (arg == "--port") serve_port = std::stoi(next());
+        else if (arg == "--chatml") use_chatml = true;
+        else if (arg == "--system") system_prompt = next();
     }
 
     if (config.model_path.empty()) {
@@ -151,8 +157,18 @@ int main(int argc, char** argv) {
         return run_server(engine, engine.model_config().name, serve_host, serve_port);
     }
 
-    printf("Type 'exit' or 'quit' to stop. Ctrl+C to abort.\n");
+    if (use_chatml) {
+        printf("Chat mode (ChatML). Type 'exit' to stop, '/reset' to clear history, '/stats' for usage.\n");
+    } else {
+        printf("Type 'exit' or 'quit' to stop. Ctrl+C to abort.\n");
+    }
     printf("\n");
+
+    // ChatML conversation history (everything before the current assistant turn)
+    std::string chatml_history;
+    if (use_chatml && !system_prompt.empty()) {
+        chatml_history = "<|im_start|>system\n" + system_prompt + "<|im_end|>\n";
+    }
 
     // Interactive chat loop
     std::string input;
@@ -167,25 +183,50 @@ int main(int argc, char** argv) {
             engine.print_stats();
             continue;
         }
+        if (input == "/reset") {
+            chatml_history.clear();
+            if (!system_prompt.empty()) {
+                chatml_history = "<|im_start|>system\n" + system_prompt + "<|im_end|>\n";
+            }
+            printf("(conversation reset)\n\n");
+            continue;
+        }
         if (input == "/help") {
             printf("Commands:\n");
             printf("  /stats   — Show memory and performance stats\n");
+            printf("  /reset   — Clear conversation history\n");
             printf("  /help    — Show this help\n");
             printf("  exit     — Quit\n\n");
             continue;
         }
 
-        // Generate response
+        // Build prompt
+        std::string prompt;
+        if (use_chatml) {
+            chatml_history += "<|im_start|>user\n" + input + "<|im_end|>\n<|im_start|>assistant\n";
+            prompt = chatml_history;
+        } else {
+            prompt = input;
+        }
+
+        // Generate response, capturing text for history
         printf("\033[1;34m");  // Blue text for model output
         fflush(stdout);
 
-        engine.generate(input, sampling,
-            [](int token_id, const std::string& text) {
+        std::string response_text;
+        engine.generate(prompt, sampling,
+            [&response_text](int /*token_id*/, const std::string& text) {
                 printf("%s", text.c_str());
                 fflush(stdout);
+                response_text += text;
             });
 
         printf("\033[0m\n\n"); // Reset color
+
+        // Append assistant response to history for next turn
+        if (use_chatml) {
+            chatml_history += response_text + "<|im_end|>\n";
+        }
     }
 
     printf("\nGoodbye.\n");
