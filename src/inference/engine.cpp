@@ -214,6 +214,23 @@ void InferenceEngine::generate(const std::string& prompt,
     for (uint32_t step = 0; step < sampling.max_tokens; step++) {
         auto t_tok = std::chrono::steady_clock::now();
 
+        // Diagnostic: check hidden state before compute_logits on first step
+        if (step == 0) {
+            cudaDeviceSynchronize();
+            float h_sample[4] = {}, r_sample[4] = {};
+            cudaMemcpy(h_sample, hidden, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(r_sample, residual, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+            LOG_INFO("hidden[0..3]   = %.6f %.6f %.6f %.6f", h_sample[0], h_sample[1], h_sample[2], h_sample[3]);
+            LOG_INFO("residual[0..3] = %.6f %.6f %.6f %.6f", r_sample[0], r_sample[1], r_sample[2], r_sample[3]);
+
+            // Check if hidden is all zeros
+            float h_sum = 0;
+            std::vector<float> h_check(cfg.hidden_dim);
+            cudaMemcpy(h_check.data(), hidden, cfg.hidden_dim * sizeof(float), cudaMemcpyDeviceToHost);
+            for (auto v : h_check) h_sum += fabsf(v);
+            LOG_INFO("hidden L1 norm = %.6f (dim=%u)", h_sum, cfg.hidden_dim);
+        }
+
         // Compute logits from final hidden state
         model_->compute_logits(hidden, logits, nullptr);
 
