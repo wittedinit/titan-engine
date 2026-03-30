@@ -1,5 +1,6 @@
 #include "memory/memory_manager.h"
 #include "core/logging.h"
+#include <sys/stat.h>
 
 namespace titan {
 
@@ -149,6 +150,22 @@ void* MemoryManager::get_expert(uint32_t layer, uint32_t expert_id, size_t exper
 
     cache_stats_.misses++;
 
+    // Check if .bin file exists before allocating RAM — avoids thousands of
+    // alloc+free cycles for safetensors-backed models that never use .bin files.
+    char path[256];
+    snprintf(path, sizeof(path), "%s/layer_%02u.bin",
+             expert_base_path_.c_str(), layer);
+    {
+        struct stat st;
+        if (stat(path, &st) != 0) {
+            // .bin file doesn't exist — caller must use insert_expert() after loading
+            // from safetensors. Return nullptr without wasting a RAM allocation.
+            LOG_DEBUG("Expert %u/%u: no .bin file, must be loaded via safetensors",
+                      layer, expert_id);
+            return nullptr;
+        }
+    }
+
     // Need to load from NVMe
     // First, ensure we have space
     if (cache_used_ + expert_bytes > cache_budget_) {
@@ -164,9 +181,6 @@ void* MemoryManager::get_expert(uint32_t layer, uint32_t expert_id, size_t exper
     }
 
     // Read from NVMe
-    char path[256];
-    snprintf(path, sizeof(path), "%s/layer_%02u.bin",
-             expert_base_path_.c_str(), layer);
     off_t offset = (off_t)expert_id * expert_bytes;
     ssize_t read = nvme_->read_file(path, data, expert_bytes, offset);
 
