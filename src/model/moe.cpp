@@ -15,37 +15,32 @@ namespace titan {
 MoEExecutor::~MoEExecutor() {
     free_buffers();
 
-    // Free model weight allocations
-    if (embedding_) { cudaFree(embedding_); embedding_ = nullptr; }
-    if (lm_head_ && lm_head_ != embedding_) { cudaFree(lm_head_); }
-    lm_head_ = nullptr;
-    if (final_norm_) { cudaFree(final_norm_); final_norm_ = nullptr; }
+    if (memory_) {
+        auto vf = [this](void* p) { if (p) memory_->vram_free(p); };
 
-    for (auto& aw : attn_weights_) {
-        if (aw.attn_norm) cudaFree(aw.attn_norm);
-        if (aw.ffn_norm) cudaFree(aw.ffn_norm);
-        if (aw.q_proj) cudaFree(aw.q_proj);
-        if (aw.k_proj) cudaFree(aw.k_proj);
-        if (aw.v_proj) cudaFree(aw.v_proj);
-        if (aw.o_proj) cudaFree(aw.o_proj);
-        // MLA projections
-        if (aw.q_a_proj)  cudaFree(aw.q_a_proj);
-        if (aw.q_b_proj)  cudaFree(aw.q_b_proj);
-        if (aw.q_a_norm)  cudaFree(aw.q_a_norm);
-        if (aw.kv_a_proj) cudaFree(aw.kv_a_proj);
-        if (aw.kv_b_proj) cudaFree(aw.kv_b_proj);
-        if (aw.kv_a_norm) cudaFree(aw.kv_a_norm);
-    }
-    attn_weights_.clear();
+        // Free model weight allocations
+        vf(embedding_); embedding_ = nullptr;
+        if (lm_head_ && lm_head_ != embedding_) vf(lm_head_);
+        lm_head_ = nullptr;
+        vf(final_norm_); final_norm_ = nullptr;
 
-    for (auto& ms : moe_state_) {
-        if (ms.gate_weight) cudaFree(ms.gate_weight);
-        if (ms.shared_gate_proj) cudaFree(ms.shared_gate_proj);
-        if (ms.shared_up_proj) cudaFree(ms.shared_up_proj);
-        if (ms.shared_down_proj) cudaFree(ms.shared_down_proj);
-        // dense_ffn_buf is VRAM-pool backed — do not cudaFree (pool owns it)
+        for (auto& aw : attn_weights_) {
+            vf(aw.attn_norm);   vf(aw.ffn_norm);
+            vf(aw.q_proj);      vf(aw.k_proj);    vf(aw.v_proj);    vf(aw.o_proj);
+            vf(aw.q_a_proj);    vf(aw.q_b_proj);  vf(aw.q_a_norm);
+            vf(aw.kv_a_proj);   vf(aw.kv_b_proj); vf(aw.kv_a_norm);
+        }
+        attn_weights_.clear();
+
+        for (auto& ms : moe_state_) {
+            vf(ms.gate_weight);
+            vf(ms.shared_gate_proj);
+            vf(ms.shared_up_proj);
+            vf(ms.shared_down_proj);
+            vf(ms.dense_ffn_buf);
+        }
+        moe_state_.clear();
     }
-    moe_state_.clear();
 
     cuda::destroy_cublas();
 }
@@ -59,29 +54,30 @@ void MoEExecutor::allocate_buffers() {
     uint32_t moe_inter = config_.moe_intermediate_dim > 0
                          ? config_.moe_intermediate_dim : config_.intermediate_dim;
 
-    cudaMalloc(&q_buf_, qkv * sizeof(float));
-    cudaMalloc(&k_buf_, kv * sizeof(float));
-    cudaMalloc(&v_buf_, kv * sizeof(float));
-    cudaMalloc(&attn_out_, qkv * sizeof(float));
-    cudaMalloc(&norm_buf_, hd * sizeof(float));
+    auto va = [this](size_t sz) -> void* { return memory_->vram_alloc(sz); };
+    q_buf_   = (float*)va(qkv * sizeof(float));
+    k_buf_   = (float*)va(kv * sizeof(float));
+    v_buf_   = (float*)va(kv * sizeof(float));
+    attn_out_= (float*)va(qkv * sizeof(float));
+    norm_buf_= (float*)va(hd * sizeof(float));
     // MLA scratch buffers (allocated even for non-MLA models — zero cost when unused)
     uint32_t q_lr  = config_.q_lora_rank  > 0 ? config_.q_lora_rank  : hd;
     uint32_t kv_lr = config_.kv_lora_rank > 0 ? config_.kv_lora_rank : hd;
     uint32_t rope_hd = config_.rope_head_dim > 0 ? config_.rope_head_dim : 64;
     uint32_t nope_hd = config_.nope_head_dim > 0 ? config_.nope_head_dim : (hd / config_.num_attn_heads);
     uint32_t v_hd    = config_.v_head_dim > 0 ? config_.v_head_dim : nope_hd;
-    cudaMalloc(&c_q_buf_,    q_lr  * sizeof(float));
-    cudaMalloc(&c_kv_buf_,   (kv_lr + rope_hd) * sizeof(float));
-    cudaMalloc(&kv_expanded_, config_.num_kv_heads * (nope_hd + v_hd) * sizeof(float));
-    cudaMalloc(&k_nope_buf_,  config_.num_kv_heads * nope_hd * sizeof(float));
-    cudaMalloc(&v_mla_buf_,   config_.num_kv_heads * v_hd * sizeof(float));
-    cudaMalloc(&k_full_buf_,  config_.num_kv_heads * (nope_hd + rope_hd) * sizeof(float));
-    cudaMalloc(&q_nope_buf_,  config_.num_attn_heads * nope_hd * sizeof(float));
-    cudaMalloc(&gate_logits_, ne * sizeof(float));
-    cudaMalloc(&routing_weights_, k * sizeof(float));
-    cudaMalloc(&routing_indices_, k * sizeof(int));
-    cudaMalloc(&expert_outputs_, k * hd * sizeof(float));
-    cudaMalloc(&shared_out_, hd * sizeof(float));
+    c_q_buf_    = (float*)va(q_lr  * sizeof(float));
+    c_kv_buf_   = (float*)va((kv_lr + rope_hd) * sizeof(float));
+    kv_expanded_= (float*)va(config_.num_kv_heads * (nope_hd + v_hd) * sizeof(float));
+    k_nope_buf_ = (float*)va(config_.num_kv_heads * nope_hd * sizeof(float));
+    v_mla_buf_  = (float*)va(config_.num_kv_heads * v_hd * sizeof(float));
+    k_full_buf_ = (float*)va(config_.num_kv_heads * (nope_hd + rope_hd) * sizeof(float));
+    q_nope_buf_ = (float*)va(config_.num_attn_heads * nope_hd * sizeof(float));
+    gate_logits_     = (float*)va(ne * sizeof(float));
+    routing_weights_ = (float*)va(k * sizeof(float));
+    routing_indices_ = (int*)  va(k * sizeof(int));
+    expert_outputs_  = (float*)va(k * hd * sizeof(float));
+    shared_out_      = (float*)va(hd * sizeof(float));
 
     // Pre-allocate expert weight staging buffers.
     // Size depends on format: FP32 (3×moe_inter×hd×4) or NVFP4 (packed U8 + F8 scales).
@@ -93,17 +89,17 @@ void MoEExecutor::allocate_buffers() {
     } else {
         expert_weight_buf_size_ = 3 * (size_t)moe_inter * hd * sizeof(float);
     }
-    cudaMalloc(&expert_weight_buf_[0], expert_weight_buf_size_);
-    cudaMalloc(&expert_weight_buf_[1], expert_weight_buf_size_);
+    expert_weight_buf_[0] = va(expert_weight_buf_size_);
+    expert_weight_buf_[1] = va(expert_weight_buf_size_);
 
     // Pre-allocate expert activation scratch — size to max of MoE inter and dense inter
     // so the same buffers can be reused for both MoE experts and dense FFN layers.
     uint32_t dense_inter = config_.intermediate_dim > 0 ? config_.intermediate_dim : moe_inter;
     uint32_t max_inter = std::max(moe_inter, dense_inter);
-    cudaMalloc(&expert_gate_out_, max_inter * sizeof(float));
-    cudaMalloc(&expert_up_out_,   max_inter * sizeof(float));
-    cudaMalloc(&shared_gate_out_, moe_inter * sizeof(float));
-    cudaMalloc(&shared_up_out_, moe_inter * sizeof(float));
+    expert_gate_out_ = (float*)va(max_inter * sizeof(float));
+    expert_up_out_   = (float*)va(max_inter * sizeof(float));
+    shared_gate_out_ = (float*)va(moe_inter * sizeof(float));
+    shared_up_out_   = (float*)va(moe_inter * sizeof(float));
 
     LOG_INFO("MoE buffers pre-allocated: %.1f MB expert staging, %.1f MB scratch",
              expert_weight_buf_size_ * 2 / 1e6,
@@ -111,15 +107,18 @@ void MoEExecutor::allocate_buffers() {
 }
 
 void MoEExecutor::free_buffers() {
-    auto sf = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };
-    sf(q_buf_); sf(k_buf_); sf(v_buf_); sf(attn_out_); sf(norm_buf_);
-    sf(gate_logits_); sf(routing_weights_); sf(routing_indices_);
-    sf(expert_outputs_); sf(shared_out_);
+    if (!memory_) return;
+    auto sf = [this](void*& p) { if (p) { memory_->vram_free(p); p = nullptr; } };
+    auto sff = [this](float*& p) { if (p) { memory_->vram_free(p); p = nullptr; } };
+    auto sfi = [this](int*& p) { if (p) { memory_->vram_free(p); p = nullptr; } };
+    sff(q_buf_); sff(k_buf_); sff(v_buf_); sff(attn_out_); sff(norm_buf_);
+    sff(gate_logits_); sff(routing_weights_); sfi(routing_indices_);
+    sff(expert_outputs_); sff(shared_out_);
     sf(expert_weight_buf_[0]); sf(expert_weight_buf_[1]);
-    sf(expert_gate_out_); sf(expert_up_out_);
-    sf(shared_gate_out_); sf(shared_up_out_);
-    sf(c_q_buf_); sf(c_kv_buf_); sf(kv_expanded_);
-    sf(k_nope_buf_); sf(v_mla_buf_); sf(k_full_buf_); sf(q_nope_buf_);
+    sff(expert_gate_out_); sff(expert_up_out_);
+    sff(shared_gate_out_); sff(shared_up_out_);
+    sff(c_q_buf_); sff(c_kv_buf_); sff(kv_expanded_);
+    sff(k_nope_buf_); sff(v_mla_buf_); sff(k_full_buf_); sff(q_nope_buf_);
     if (nvfp4_load_buf_) { cudaFreeHost(nvfp4_load_buf_); nvfp4_load_buf_ = nullptr; }
 }
 
@@ -241,17 +240,17 @@ bool MoEExecutor::initialize(const std::string& model_path,
         auto emb_meta = loader.get_meta("model.embed_tokens.weight");
         embedding_is_bf16_ = (emb_meta.dtype == DType::BF16 || emb_meta.dtype == DType::FP16);
         size_t emb_alloc = (size_t)vocab * hd * (embedding_is_bf16_ ? sizeof(uint16_t) : sizeof(float));
-        cudaMalloc(&embedding_, emb_alloc);
+        embedding_ = memory_->vram_alloc(emb_alloc);
         cudaMemset(embedding_, 0, emb_alloc);
         loader.read_tensor_gpu("model.embed_tokens.weight", embedding_, emb_meta.byte_size());
     } else {
         embedding_is_bf16_ = false;
-        cudaMalloc(&embedding_, (size_t)vocab * hd * sizeof(float));
+        embedding_ = memory_->vram_alloc((size_t)vocab * hd * sizeof(float));
         cudaMemset(embedding_, 0, (size_t)vocab * hd * sizeof(float));
     }
 
     // Final norm — always FP32 (tiny vector, used by rmsnorm kernel)
-    cudaMalloc(&final_norm_, hd * sizeof(float));
+    final_norm_ = (float*)memory_->vram_alloc(hd * sizeof(float));
     std::vector<float> ones(hd, 1.0f);
     cudaMemcpy(final_norm_, ones.data(), hd * sizeof(float), cudaMemcpyHostToDevice);
     if (loader.has_tensor("model.norm.weight")) {
@@ -282,7 +281,7 @@ bool MoEExecutor::initialize(const std::string& model_path,
     if (loader.has_tensor("lm_head.weight")) {
         auto lm_meta = loader.get_meta("lm_head.weight");
         size_t lm_alloc = (size_t)vocab * hd * (embedding_is_bf16_ ? sizeof(uint16_t) : sizeof(float));
-        cudaMalloc(&lm_head_, lm_alloc);
+        lm_head_ = memory_->vram_alloc(lm_alloc);
         loader.read_tensor_gpu("lm_head.weight", lm_head_, lm_meta.byte_size());
     } else {
         lm_head_ = embedding_; // Tied weights
@@ -298,8 +297,8 @@ bool MoEExecutor::initialize(const std::string& model_path,
         std::string lp = "model.layers." + std::to_string(l);
 
         // Norms
-        cudaMalloc(&aw.attn_norm, hd * sizeof(float));
-        cudaMalloc(&aw.ffn_norm, hd * sizeof(float));
+        aw.attn_norm = (float*)memory_->vram_alloc(hd * sizeof(float));
+        aw.ffn_norm  = (float*)memory_->vram_alloc(hd * sizeof(float));
         cudaMemcpy(aw.attn_norm, ones.data(), hd * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(aw.ffn_norm, ones.data(), hd * sizeof(float), cudaMemcpyHostToDevice);
 
@@ -320,13 +319,13 @@ bool MoEExecutor::initialize(const std::string& model_path,
             uint32_t o_in_mla = config_.num_attn_heads * (config_.v_head_dim > 0
                                   ? config_.v_head_dim : (config_.nope_head_dim > 0
                                     ? config_.nope_head_dim : config_.head_dim));
-            cudaMalloc(&aw.o_proj, hd * o_in_mla * sizeof(uint16_t));
+            aw.o_proj = memory_->vram_alloc(hd * o_in_mla * sizeof(uint16_t));
             cudaMemset(aw.o_proj, 0, hd * o_in_mla * sizeof(uint16_t));
         } else {
-            cudaMalloc(&aw.q_proj, qkv * hd * sizeof(float));
-            cudaMalloc(&aw.k_proj, kv * hd * sizeof(float));
-            cudaMalloc(&aw.v_proj, kv * hd * sizeof(float));
-            cudaMalloc(&aw.o_proj, hd * qkv * sizeof(float));
+            aw.q_proj = memory_->vram_alloc(qkv * hd * sizeof(float));
+            aw.k_proj = memory_->vram_alloc(kv * hd * sizeof(float));
+            aw.v_proj = memory_->vram_alloc(kv * hd * sizeof(float));
+            aw.o_proj = memory_->vram_alloc(hd * qkv * sizeof(float));
             cudaMemset(aw.q_proj, 0, qkv * hd * sizeof(float));
             cudaMemset(aw.k_proj, 0, kv * hd * sizeof(float));
             cudaMemset(aw.v_proj, 0, kv * hd * sizeof(float));
@@ -346,12 +345,12 @@ bool MoEExecutor::initialize(const std::string& model_path,
             uint32_t kv_b_rows = config_.num_kv_heads * (nope_hd + v_hd);
 
             // Allocate BF16 projection matrices (2 bytes/elem instead of 4)
-            cudaMalloc(&aw.q_a_proj,  (size_t)q_lr * hd * sizeof(uint16_t));
-            cudaMalloc(&aw.q_b_proj,  (size_t)qkv  * q_lr * sizeof(uint16_t));
-            cudaMalloc(&aw.q_a_norm,  q_lr * sizeof(float));
-            cudaMalloc(&aw.kv_a_proj, (size_t)kv_a_rows * hd * sizeof(uint16_t));
-            cudaMalloc(&aw.kv_b_proj, (size_t)kv_b_rows * kv_lr * sizeof(uint16_t));
-            cudaMalloc(&aw.kv_a_norm, kv_lr * sizeof(float));
+            aw.q_a_proj  = memory_->vram_alloc((size_t)q_lr * hd * sizeof(uint16_t));
+            aw.q_b_proj  = memory_->vram_alloc((size_t)qkv  * q_lr * sizeof(uint16_t));
+            aw.q_a_norm  = (float*)memory_->vram_alloc(q_lr * sizeof(float));
+            aw.kv_a_proj = memory_->vram_alloc((size_t)kv_a_rows * hd * sizeof(uint16_t));
+            aw.kv_b_proj = memory_->vram_alloc((size_t)kv_b_rows * kv_lr * sizeof(uint16_t));
+            aw.kv_a_norm = (float*)memory_->vram_alloc(kv_lr * sizeof(float));
             cudaMemset(aw.q_a_proj,  0, (size_t)q_lr * hd * sizeof(uint16_t));
             cudaMemset(aw.q_b_proj,  0, (size_t)qkv  * q_lr * sizeof(uint16_t));
             // Norm weights stay FP32 (tiny vectors, used by rmsnorm kernel)
@@ -468,7 +467,7 @@ bool MoEExecutor::initialize(const std::string& model_path,
             ms.gate_weight = nullptr;
         } else {
             // Routing gate
-            cudaMalloc(&ms.gate_weight, config_.num_experts * hd * sizeof(float));
+            ms.gate_weight = (float*)memory_->vram_alloc(config_.num_experts * hd * sizeof(float));
             cudaMemset(ms.gate_weight, 0, config_.num_experts * hd * sizeof(float));
             try_load(lp + ".mlp.gate.weight", ms.gate_weight, config_.num_experts * hd * sizeof(float));
         }
@@ -478,9 +477,9 @@ bool MoEExecutor::initialize(const std::string& model_path,
         // be directly used with the FP32 gemv path. Leave nullptr to skip the
         // shared expert in forward_layer() (fused_moe_combine_norm handles nullptr).
         if (config_.num_shared_experts > 0 && !has_nvfp4) {
-            cudaMalloc(&ms.shared_gate_proj, moe_inter * hd * sizeof(float));
-            cudaMalloc(&ms.shared_up_proj, moe_inter * hd * sizeof(float));
-            cudaMalloc(&ms.shared_down_proj, hd * moe_inter * sizeof(float));
+            ms.shared_gate_proj = memory_->vram_alloc(moe_inter * hd * sizeof(float));
+            ms.shared_up_proj   = memory_->vram_alloc(moe_inter * hd * sizeof(float));
+            ms.shared_down_proj = memory_->vram_alloc(hd * moe_inter * sizeof(float));
             cudaMemset(ms.shared_gate_proj, 0, moe_inter * hd * sizeof(float));
             cudaMemset(ms.shared_up_proj, 0, moe_inter * hd * sizeof(float));
             cudaMemset(ms.shared_down_proj, 0, hd * moe_inter * sizeof(float));
