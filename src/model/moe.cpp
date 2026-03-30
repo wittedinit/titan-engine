@@ -140,12 +140,18 @@ bool MoEExecutor::initialize(const std::string& model_path,
 
     cuda::init_cublas();
 
-    // For MLA (Multi-head Latent Attention), the KV cache stores K_nope and V
-    // which both have dimension nope_head_dim (= v_head_dim for Kimi K2 models).
-    // For standard GQA, use the full head_dim.
-    uint32_t kv_cache_head_dim = config_.has_mla && config_.nope_head_dim > 0
-                                  ? config_.nope_head_dim
-                                  : config_.head_dim;
+    // MLA KV cache: K stores full nope+rope dims for attention scoring,
+    // V stores only nope (= v_head_dim) for output projection.
+    // Standard GQA: K and V both use head_dim.
+    uint32_t k_cache_hd, v_cache_hd;
+    if (config_.has_mla && config_.nope_head_dim > 0) {
+        uint32_t rope_hd = config_.rope_head_dim > 0 ? config_.rope_head_dim : 0;
+        k_cache_hd = config_.nope_head_dim + rope_hd;  // 128+64=192 for Kimi K2.5
+        v_cache_hd = config_.v_head_dim > 0 ? config_.v_head_dim : config_.nope_head_dim;
+    } else {
+        k_cache_hd = config_.head_dim;
+        v_cache_hd = config_.head_dim;
+    }
     // NOTE: KV cache is allocated AFTER model weights + scratch buffers so the
     // budget calculation reflects actual remaining VRAM.  (See alloc at end of init.)
 
@@ -541,17 +547,13 @@ bool MoEExecutor::initialize(const std::string& model_path,
     allocate_buffers();
 
     // Allocate KV cache with whatever VRAM remains after model weights + scratch buffers.
-    // Doing this last ensures the budget is accurate — on large models like Kimi K2.5,
-    // fixed attention weights consume ~28 GB, leaving only ~1-2 GB for the KV cache.
-    // With MLA's expanded KV representation (num_kv_heads × nope_head_dim per position),
-    // each context position costs 2 × num_layers × num_kv_heads × nope_head_dim × 4 bytes.
     {
         size_t pool_free = memory_ ? memory_->vram_free_bytes() : 0;
         LOG_INFO("VRAM pool free for KV cache (after weights): %.1f MB", pool_free / 1e6);
 
-        size_t kv_per_ctx = 2ULL * config_.num_layers * config_.num_kv_heads
-                            * kv_cache_head_dim * sizeof(float);
-        // Leave 256 MB headroom for inference scratch buffers in engine.cpp
+        // Per-position cost: K (k_cache_hd) + V (v_cache_hd) per KV head per layer
+        size_t kv_per_ctx = (size_t)config_.num_layers * config_.num_kv_heads
+                            * (k_cache_hd + v_cache_hd) * sizeof(float);
         size_t kv_budget = (pool_free > 256ULL << 20) ? pool_free - (256ULL << 20) : 0;
         uint32_t max_ctx_by_pool = (kv_per_ctx > 0 && kv_budget > 0)
                                    ? (uint32_t)(kv_budget / kv_per_ctx)
@@ -563,23 +565,33 @@ bool MoEExecutor::initialize(const std::string& model_path,
                      runtime.max_context_len, capped_ctx, pool_free / 1e6);
         }
 
-        size_t kv_bytes = (size_t)config_.num_layers * (size_t)capped_ctx
-                          * config_.num_kv_heads * kv_cache_head_dim * sizeof(float);
-        float* k_buf = (float*)memory_->vram_alloc(kv_bytes);
-        float* v_buf = (float*)memory_->vram_alloc(kv_bytes);
+        size_t k_bytes = (size_t)config_.num_layers * (size_t)capped_ctx
+                          * config_.num_kv_heads * k_cache_hd * sizeof(float);
+        size_t v_bytes = (size_t)config_.num_layers * (size_t)capped_ctx
+                          * config_.num_kv_heads * v_cache_hd * sizeof(float);
+        float* k_buf = (float*)memory_->vram_alloc(k_bytes);
+        float* v_buf = (float*)memory_->vram_alloc(v_bytes);
 
         if (!k_buf || !v_buf) {
             LOG_ERROR("KV cache: failed to allocate %.1f MB from VRAM pool (pool_free=%.1f MB)",
-                      kv_bytes * 2 / 1e6, pool_free / 1e6);
+                      (k_bytes + v_bytes) / 1e6, pool_free / 1e6);
             return false;
         }
 
-        LOG_INFO("KV cache: %u positions × %.1f MB/pos = %.1f MB total",
-                 capped_ctx, kv_per_ctx / 1e6, kv_bytes * 2 / 1e6);
+        LOG_INFO("KV cache: %u positions × %.1f MB/pos = %.1f MB total (K:%u V:%u dims)",
+                 capped_ctx, kv_per_ctx / 1e6, (k_bytes + v_bytes) / 1e6,
+                 k_cache_hd, v_cache_hd);
 
-        if (!kv_cache_.initialize_external(config_.num_layers, config_.num_kv_heads,
-                                            kv_cache_head_dim, capped_ctx, k_buf, v_buf))
-            return false;
+        if (k_cache_hd != v_cache_hd) {
+            if (!kv_cache_.initialize_external_mla(config_.num_layers, config_.num_kv_heads,
+                                                    k_cache_hd, v_cache_hd, capped_ctx,
+                                                    k_buf, v_buf))
+                return false;
+        } else {
+            if (!kv_cache_.initialize_external(config_.num_layers, config_.num_kv_heads,
+                                                k_cache_hd, capped_ctx, k_buf, v_buf))
+                return false;
+        }
     }
 
     LOG_INFO("MoE executor ready: %s (%uL, %u experts, K=%u, shared=%u)",
@@ -774,37 +786,33 @@ void MoEExecutor::forward_layer(float* hidden, float* residual,
             cuda::mla_assemble_k(k_nope_buf_, c_kv_buf_ + kv_lr, k_full_buf_,
                                   config_.num_kv_heads, nope_hd, rope_hd, stream);
         } else {
-            // No rope component — k_full = k_nope
             cudaMemcpyAsync(k_full_buf_, k_nope_buf_,
                             config_.num_kv_heads * nope_hd * sizeof(float),
                             cudaMemcpyDeviceToDevice, stream);
         }
 
-        // Apply RoPE to rope portions of Q and K
-        // Q: rope portion starts at nope_hd per head; K: assembled k_full has rope at end
-        // The standard apply_rope expects Q[n_heads*head_dim] and K[n_kv_heads*head_dim]
-        // For MLA: head_dim = nope_hd + rope_hd, rope is applied to last rope_hd dims
-        uint32_t eff_head_dim = nope_hd + rope_hd;
-        cuda::apply_rope(q_buf_, k_full_buf_,
-                         config_.num_attn_heads, config_.num_kv_heads,
-                         eff_head_dim, position, config_.rope_theta,
-                         config_.rope_scaling, stream);
+        // Apply RoPE only to the rope portion (last rope_hd dims per head)
+        // q_buf_ layout: [n_heads, nope_hd + rope_hd] — rope at offset nope_hd
+        // k_full_buf_ layout: [n_kv_heads, nope_hd + rope_hd] — rope at offset nope_hd
+        if (rope_hd > 0) {
+            cuda::apply_rope_mla(q_buf_, k_full_buf_,
+                                  config_.num_attn_heads, config_.num_kv_heads,
+                                  nope_hd, rope_hd, position, config_.rope_theta,
+                                  stream);
+        }
 
-        // Extract Q nope for attention: use Q_nope × K_nope (simplified — drops RoPE)
-        cuda::mla_extract_q_nope(q_buf_, q_nope_buf_,
-                                  config_.num_attn_heads, nope_hd, rope_hd, stream);
+        // Store full K (nope + rope'd) and V in KV cache
+        // K cache: [n_kv_heads * (nope_hd + rope_hd)] per position
+        // V cache: [n_kv_heads * v_hd] per position
+        kv_cache_.update(layer_id, position, k_full_buf_, v_mla_buf_, stream);
 
-        // Store K_nope and V in KV cache (head_dim = nope_hd for KV cache in MLA)
-        kv_cache_.update(layer_id, position, k_nope_buf_, v_mla_buf_, stream);
-
-        // Attention decode: use Q_nope [n_heads*nope_hd] and K_nope / V [n_kv*nope_hd].
-        // This simplification drops RoPE from the computation; positional encoding is
-        // approximate until full MLA-RoPE attention is implemented.
+        // Full MLA attention: score with full Q×K (nope+rope dims), output with V (v_hd dims)
+        uint32_t full_hd = nope_hd + rope_hd;
         int seq_len = std::max(1, kv_cache_.seq_len());
-        cuda::attention_decode(q_nope_buf_, kv_cache_.k_cache(layer_id),
-                               kv_cache_.v_cache(layer_id), attn_out_,
-                               config_.num_attn_heads, config_.num_kv_heads,
-                               nope_hd, seq_len, stream);
+        cuda::attention_decode_mla(q_buf_, kv_cache_.k_cache(layer_id),
+                                    kv_cache_.v_cache(layer_id), attn_out_,
+                                    config_.num_attn_heads, config_.num_kv_heads,
+                                    full_hd, v_hd, seq_len, stream);
 
         // O proj (BF16): shape [hidden, n_heads*v_hd] = [7168, 8192]
         uint32_t o_in_dim = config_.num_attn_heads * v_hd;

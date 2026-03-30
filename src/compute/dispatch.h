@@ -67,9 +67,16 @@ namespace cuda {
     // --- attention.cu ---
     void apply_rope(float* q, float* k, int num_heads, int num_kv_heads, int head_dim,
                     int position, float theta, float scaling, cudaStream_t stream);
+    void apply_rope_mla(float* q, float* k, int num_heads, int num_kv_heads,
+                         int nope_hd, int rope_hd, int position, float theta,
+                         cudaStream_t stream);
     void attention_decode(const float* q, const float* k_cache, const float* v_cache,
                           float* output, int num_heads, int num_kv_heads,
                           int head_dim, int seq_len, cudaStream_t stream);
+    void attention_decode_mla(const float* q, const float* k_cache, const float* v_cache,
+                               float* output, int num_heads, int num_kv_heads,
+                               int k_head_dim, int v_head_dim, int seq_len,
+                               cudaStream_t stream);
 
     // --- moe.cu ---
     void moe_gate(const float* hidden, const float* gate_weight, float* logits,
