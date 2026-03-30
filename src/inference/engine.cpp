@@ -229,22 +229,30 @@ void InferenceEngine::generate(const std::string& prompt,
             cudaMemcpy(h_check.data(), hidden, cfg.hidden_dim * sizeof(float), cudaMemcpyDeviceToHost);
             for (auto v : h_check) h_sum += (v > 0 ? v : -v);
             LOG_INFO("hidden L1 norm = %.6f (dim=%u)", h_sum, cfg.hidden_dim);
-        }
 
-        // Compute logits from final hidden state
-        model_->compute_logits(hidden, logits, nullptr);
-
-        // Sync and check for CUDA errors before sampling (first token only)
-        if (step == 0) {
-            cudaError_t err = cudaDeviceSynchronize();
-            if (err != cudaSuccess) {
-                LOG_ERROR("CUDA error before sampling step 0: %s", cudaGetErrorString(err));
-            }
-            // Log first few logit values for diagnostics
-            float logit_sample[4] = {};
-            cudaMemcpy(logit_sample, logits, 4 * sizeof(float), cudaMemcpyDeviceToHost);
-            LOG_INFO("logits[0..3] = %.4f %.4f %.4f %.4f",
-                     logit_sample[0], logit_sample[1], logit_sample[2], logit_sample[3]);
+            // Check norm_buf_ after compute_logits rmsnorm step
+            // Do rmsnorm manually to see intermediate
+            float norm_sample[4] = {};
+            model_->compute_logits(hidden, logits, nullptr);
+            cudaDeviceSynchronize();
+            // Read logits again
+            float lg2[4] = {};
+            cudaMemcpy(lg2, logits, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+            LOG_INFO("logits[0..3] after compute_logits = %.6f %.6f %.6f %.6f",
+                     lg2[0], lg2[1], lg2[2], lg2[3]);
+            // Check a few logits from the middle
+            float lg_mid[4] = {};
+            cudaMemcpy(lg_mid, logits + cfg.vocab_size / 2, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+            LOG_INFO("logits[mid..mid+3] = %.6f %.6f %.6f %.6f", lg_mid[0], lg_mid[1], lg_mid[2], lg_mid[3]);
+            // Check sum of all logits
+            float lg_sum = 0;
+            std::vector<float> all_logits(cfg.vocab_size);
+            cudaMemcpy(all_logits.data(), logits, cfg.vocab_size * sizeof(float), cudaMemcpyDeviceToHost);
+            for (auto v : all_logits) lg_sum += (v > 0 ? v : -v);
+            LOG_INFO("logits L1 norm = %.6f (vocab=%u)", lg_sum, cfg.vocab_size);
+        } else {
+            // Compute logits from final hidden state (non-diagnostic path)
+            model_->compute_logits(hidden, logits, nullptr);
         }
 
         // Sample next token
