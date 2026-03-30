@@ -113,13 +113,20 @@ bool InferenceEngine::load_model(const std::string& model_path) {
     size_t hidden_bytes = mc.hidden_dim * sizeof(float);
     size_t logits_bytes = mc.vocab_size * sizeof(float);
 
+    LOG_INFO("VRAM after model load: %.1f / %.1f GB (%.1f GB free) — need %.1f MB for inference buffers",
+             memory_->vram().used() / 1e9,
+             memory_->vram().capacity() / 1e9,
+             memory_->vram().available() / 1e9,
+             (2 * hidden_bytes + logits_bytes + sizeof(int)) / 1e6);
+
     hidden_            = (float*)memory_->vram_alloc(hidden_bytes);
     residual_          = (float*)memory_->vram_alloc(hidden_bytes);
     logits_            = (float*)memory_->vram_alloc(logits_bytes);
     sampled_token_gpu_ = (int*)  memory_->vram_alloc(sizeof(int));
 
     if (!hidden_ || !residual_ || !logits_ || !sampled_token_gpu_) {
-        LOG_ERROR("Failed to allocate pre-allocated inference buffers");
+        LOG_ERROR("Failed to allocate pre-allocated inference buffers (hidden=%p residual=%p logits=%p token=%p)",
+                  (void*)hidden_, (void*)residual_, (void*)logits_, (void*)sampled_token_gpu_);
         return false;
     }
 
