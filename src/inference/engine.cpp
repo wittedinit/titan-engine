@@ -14,10 +14,12 @@
 namespace titan {
 
 InferenceEngine::~InferenceEngine() {
-    if (hidden_) cudaFree(hidden_);
-    if (residual_) cudaFree(residual_);
-    if (logits_) cudaFree(logits_);
-    if (sampled_token_gpu_) cudaFree(sampled_token_gpu_);
+    if (memory_) {
+        if (hidden_)            memory_->vram_free(hidden_);
+        if (residual_)          memory_->vram_free(residual_);
+        if (logits_)            memory_->vram_free(logits_);
+        if (sampled_token_gpu_) memory_->vram_free(sampled_token_gpu_);
+    }
 }
 
 bool InferenceEngine::initialize(const RuntimeConfig& config) {
@@ -111,10 +113,10 @@ bool InferenceEngine::load_model(const std::string& model_path) {
     size_t hidden_bytes = mc.hidden_dim * sizeof(float);
     size_t logits_bytes = mc.vocab_size * sizeof(float);
 
-    cudaMalloc(&hidden_, hidden_bytes);
-    cudaMalloc(&residual_, hidden_bytes);
-    cudaMalloc(&logits_, logits_bytes);
-    cudaMalloc(&sampled_token_gpu_, sizeof(int));
+    hidden_            = (float*)memory_->vram_alloc(hidden_bytes);
+    residual_          = (float*)memory_->vram_alloc(hidden_bytes);
+    logits_            = (float*)memory_->vram_alloc(logits_bytes);
+    sampled_token_gpu_ = (int*)  memory_->vram_alloc(sizeof(int));
 
     if (!hidden_ || !residual_ || !logits_ || !sampled_token_gpu_) {
         LOG_ERROR("Failed to allocate pre-allocated inference buffers");
