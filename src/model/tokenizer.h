@@ -39,6 +39,12 @@ public:
     // Check if a token is special (BOS, EOS, etc.)
     bool is_special(int token_id) const;
 
+    // Look up token ID by string (returns -1 if not found)
+    int token_to_id(const std::string& token) const {
+        auto it = token_to_id_.find(token);
+        return (it != token_to_id_.end()) ? it->second : -1;
+    }
+
 private:
     // Vocabulary: token string ↔ ID
     std::unordered_map<std::string, int> token_to_id_;

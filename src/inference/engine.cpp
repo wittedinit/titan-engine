@@ -276,9 +276,9 @@ void InferenceEngine::generate(const std::string& prompt,
             break;
         }
 
-        // Check for EOS
-        if (token_id == tokenizer_.eos_id()) {
-            LOG_DEBUG("EOS token generated at step %d", step);
+        // Check for EOS or special stop tokens (<|im_end|>, [EOS], etc.)
+        if (token_id == tokenizer_.eos_id() || tokenizer_.is_special(token_id)) {
+            LOG_DEBUG("Stop token generated at step %d (id=%d)", step, token_id);
             break;
         }
 

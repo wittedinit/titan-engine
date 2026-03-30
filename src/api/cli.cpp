@@ -166,10 +166,17 @@ int main(int argc, char** argv) {
     }
     printf("\n");
 
-    // ChatML conversation history (everything before the current assistant turn)
+    // Chat template history.
+    // Kimi K2.5 uses: <|im_system|>...<|im_end|><|im_user|>...<|im_end|><|im_assistant|>
+    // Standard ChatML uses: <|im_start|>system\n...<|im_end|>\n<|im_start|>user\n...<|im_end|>\n
+    // Auto-detect: if the tokenizer has <|im_user|>, use Kimi format; else standard ChatML.
+    bool kimi_format = (engine.tokenizer().token_to_id("<|im_user|>") >= 0);
     std::string chatml_history;
     if (use_chatml && !system_prompt.empty()) {
-        chatml_history = "<|im_start|>system\n" + system_prompt + "<|im_end|>\n";
+        if (kimi_format)
+            chatml_history = "<|im_system|>" + system_prompt + "<|im_end|>";
+        else
+            chatml_history = "<|im_start|>system\n" + system_prompt + "<|im_end|>\n";
     }
 
     // Interactive chat loop
@@ -188,7 +195,10 @@ int main(int argc, char** argv) {
         if (input == "/reset") {
             chatml_history.clear();
             if (!system_prompt.empty()) {
-                chatml_history = "<|im_start|>system\n" + system_prompt + "<|im_end|>\n";
+                if (kimi_format)
+                    chatml_history = "<|im_system|>" + system_prompt + "<|im_end|>";
+                else
+                    chatml_history = "<|im_start|>system\n" + system_prompt + "<|im_end|>\n";
             }
             printf("(conversation reset)\n\n");
             continue;
@@ -205,7 +215,10 @@ int main(int argc, char** argv) {
         // Build prompt
         std::string prompt;
         if (use_chatml) {
-            chatml_history += "<|im_start|>user\n" + input + "<|im_end|>\n<|im_start|>assistant\n";
+            if (kimi_format)
+                chatml_history += "<|im_user|>" + input + "<|im_end|><|im_assistant|>";
+            else
+                chatml_history += "<|im_start|>user\n" + input + "<|im_end|>\n<|im_start|>assistant\n";
             prompt = chatml_history;
         } else {
             prompt = input;
