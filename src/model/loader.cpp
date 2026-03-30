@@ -9,6 +9,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <dirent.h>
+#include <unordered_set>
 
 #include <cuda_runtime.h>
 
@@ -263,6 +265,35 @@ bool ModelLoader::load_sharded(const std::string& index_path) {
         size_t shard_idx = file_to_idx[file];
         // Find tensor meta in this shard
         // (already populated by parse_shard_header)
+    }
+
+    // Also scan any safetensors files in the directory that aren't in the index.
+    // Some models (e.g. NVFP4-quantized MoE models) have expert weight shards that
+    // are not listed in model.safetensors.index.json but are present on disk.
+    {
+        std::unordered_set<std::string> indexed_files;
+        for (const auto& [_, file] : weight_map) indexed_files.insert(file);
+
+        // Glob for *.safetensors in model_dir_
+        std::string dir = model_dir_;
+        DIR* dp = opendir(dir.c_str());
+        if (dp) {
+            struct dirent* ep;
+            while ((ep = readdir(dp))) {
+                std::string fname(ep->d_name);
+                if (fname.size() > 12 && fname.substr(fname.size() - 12) == ".safetensors") {
+                    if (indexed_files.find(fname) == indexed_files.end()) {
+                        // Unindexed shard — parse its header and add tensors
+                        size_t shard_idx = shards_.size();
+                        ShardInfo si;
+                        si.path = dir + "/" + fname;
+                        shards_.push_back(si);
+                        parse_shard_header(shard_idx);  // errors silently skipped
+                    }
+                }
+            }
+            closedir(dp);
+        }
     }
 
     LOG_INFO("Loaded %zu shards, %zu tensors", shards_.size(), tensors_.size());
