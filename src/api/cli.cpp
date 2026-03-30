@@ -77,6 +77,7 @@ int main(int argc, char** argv) {
     bool verbose = false;
     bool serve_mode = false;
     bool use_chatml = false;
+    bool quant_explicit = false;
     std::string system_prompt;
     std::string serve_host = "0.0.0.0";
     int serve_port = 8080;
@@ -110,7 +111,8 @@ int main(int argc, char** argv) {
         auto next = [&]() -> std::string {
             return (i + 1 < argc) ? argv[++i] : "";
         };
-        if (arg == "--temp") sampling.temperature = std::stof(next());
+        if (arg == "--quant" || arg == "-q") { quant_explicit = true; next(); } // already parsed by parse_cli_args
+        else if (arg == "--temp") sampling.temperature = std::stof(next());
         else if (arg == "--top-p") sampling.top_p = std::stof(next());
         else if (arg == "--top-k") sampling.top_k = std::stoul(next());
         else if (arg == "--max-tokens") sampling.max_tokens = std::stoul(next());
@@ -148,8 +150,8 @@ int main(int argc, char** argv) {
            engine.model_config().name.c_str(),
            engine.model_config().total_params() / 1e9);
     printf("Quant: %s | Context: %u | Temp: %.1f\n",
-           dtype_name(config.weight_dtype), config.max_context_len,
-           sampling.temperature);
+           quant_explicit ? dtype_name(config.weight_dtype) : "auto-detect",
+           config.max_context_len, sampling.temperature);
 
     // Server mode: start HTTP API instead of interactive chat
     if (serve_mode) {

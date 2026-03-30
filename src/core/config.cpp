@@ -86,9 +86,16 @@ static std::string json_nested_object(const std::string& json, const std::string
 }
 
 static void parse_model_fields(const std::string& json, ModelConfig& cfg) {
-    // Model type name — try both model_type and _name_or_path
+    // Model name: prefer _name_or_path (e.g. "moonshotai/Kimi-K2.5") over model_type
+    std::string name_or_path = json_string(json, "_name_or_path", "");
     std::string mtype = json_string(json, "model_type", "");
-    if (!mtype.empty()) cfg.name = mtype;
+    if (!name_or_path.empty()) {
+        // Strip org prefix (e.g. "moonshotai/Kimi-K2.5" -> "Kimi-K2.5")
+        auto slash = name_or_path.rfind('/');
+        cfg.name = (slash != std::string::npos) ? name_or_path.substr(slash + 1) : name_or_path;
+    } else if (!mtype.empty()) {
+        cfg.name = mtype;
+    }
 
     // Core dimensions
     int64_t hs = json_int(json, "hidden_size", 0);
