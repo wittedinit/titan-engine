@@ -290,7 +290,12 @@ size_t HardwareProfile::optimal_vram_budget() const {
 }
 
 size_t HardwareProfile::optimal_ram_budget() const {
-    return (size_t)(memory.available_ram * 0.8);
+    // Reserve 16 GB for OS, filesystem page cache, and CUDA overhead.
+    // On tmpfs-backed model storage, the OS page cache can hold another copy
+    // of the expert data being read, so leaving headroom prevents OOM/swap.
+    const size_t os_headroom = 16ULL * 1024 * 1024 * 1024;
+    if (memory.available_ram <= os_headroom) return 0;
+    return (size_t)((memory.available_ram - os_headroom) * 0.75);
 }
 
 float HardwareProfile::estimated_nvme_bandwidth() const {
