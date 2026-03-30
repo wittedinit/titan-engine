@@ -227,6 +227,28 @@ void MemoryManager::prefetch_expert(uint32_t layer, uint32_t expert_id, size_t e
         });
 }
 
+void MemoryManager::insert_expert(uint32_t layer, uint32_t expert_id,
+                                   const void* src, size_t expert_bytes) {
+    uint64_t key = ((uint64_t)layer << 32) | expert_id;
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+
+    // Already cached — no-op
+    if (cache_map_.find(key) != cache_map_.end()) return;
+
+    if (cache_used_ + expert_bytes > cache_budget_) {
+        evict_experts(expert_bytes);
+    }
+
+    void* data = ram_->allocate(expert_bytes);
+    if (!data) return;
+
+    memcpy(data, src, expert_bytes);
+    CacheEntry entry{key, data, expert_bytes};
+    cache_lru_.push_front(entry);
+    cache_map_[key] = cache_lru_.begin();
+    cache_used_ += expert_bytes;
+}
+
 void MemoryManager::evict_experts(size_t needed_bytes) {
     // LRU eviction from the back
     while (cache_used_ + needed_bytes > cache_budget_ && !cache_lru_.empty()) {

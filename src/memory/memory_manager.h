@@ -201,6 +201,12 @@ public:
     // Prefetch expert to RAM (non-blocking)
     void prefetch_expert(uint32_t layer, uint32_t expert_id, size_t expert_bytes);
 
+    // Insert expert data into RAM cache (called after on-demand load from safetensors).
+    // Copies expert_bytes from src into a new RAM allocation and inserts into LRU.
+    // No-op if the expert is already cached.
+    void insert_expert(uint32_t layer, uint32_t expert_id,
+                       const void* src, size_t expert_bytes);
+
     // Expert cache stats
     struct CacheStats {
         size_t  hits = 0;

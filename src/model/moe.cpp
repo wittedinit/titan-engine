@@ -838,6 +838,9 @@ void MoEExecutor::forward_layer(float* hidden, float* residual,
                 memcpy(&down_g, cpu_buf + down_off,  sizeof(float));
                 cudaStreamSynchronize(stream); // ensure H→D transfer done
                 loaded_to_gpu = true;
+                // Cache in RAM so subsequent tokens skip the safetensors read
+                if (memory_) memory_->insert_expert(layer_id, expert_id,
+                                                     nvfp4_load_buf_, expert_bytes_);
             }
             if (!loaded_to_gpu) continue;
 
