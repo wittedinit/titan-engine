@@ -101,7 +101,7 @@ void gemv_bf16_to_fp32(
     float alpha = 1.0f, beta = 0.0f;
     // Mirror gemv_fp32 layout: A[rows,cols] row-major = [cols,rows] col-major
     // CUBLAS_OP_T transposes the stored [cols,rows] back to [rows,cols]
-    cublasGemmEx(g_cublas_handle,
+    cublasStatus_t status = cublasGemmEx(g_cublas_handle,
                  CUBLAS_OP_T, CUBLAS_OP_N,
                  rows, 1, cols,
                  &alpha,
@@ -110,6 +110,10 @@ void gemv_bf16_to_fp32(
                  &beta,
                  y, CUDA_R_32F, rows,
                  CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        LOG_ERROR("gemv_bf16_to_fp32: cublasGemmEx failed with status %d (rows=%d cols=%d)",
+                  (int)status, rows, cols);
+    }
 }
 
 // BF16 embedding lookup: copy and convert row token_id to FP32
