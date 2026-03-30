@@ -80,6 +80,12 @@ private:
         void* shared_gate_proj = nullptr;
         void* shared_up_proj = nullptr;
         void* shared_down_proj = nullptr;
+        // Dense FFN (for first_k_dense_replace layers): pre-loaded NVFP4 GPU buffer
+        void*  dense_ffn_buf = nullptr; // GPU: [gate_w|gate_s|gate_g|up_w|up_s|up_g|down_w|down_s|down_g]
+        float  dense_gate_g  = 1.0f;
+        float  dense_up_g    = 1.0f;
+        float  dense_down_g  = 1.0f;
+        bool   is_dense      = false;
     };
     std::vector<MoELayerState> moe_state_;
 
@@ -90,13 +96,22 @@ private:
     bool has_nvfp4_ = false;
     std::unique_ptr<ModelLoader> loader_;  // kept alive for on-demand expert reads
 
-    // NVFP4 per-expert layout sizes (bytes) within a staging buffer
-    size_t nvfp4_gate_w_bytes_  = 0;  // gate.weight [inter, hd/2] U8
-    size_t nvfp4_gate_s_bytes_  = 0;  // gate.weight_scale [inter, hd/16] F8
-    size_t nvfp4_up_w_bytes_    = 0;  // up.weight [inter, hd/2] U8
-    size_t nvfp4_up_s_bytes_    = 0;  // up.weight_scale [inter, hd/16] F8
-    size_t nvfp4_down_w_bytes_  = 0;  // down.weight [hd, inter/2] U8
-    size_t nvfp4_down_s_bytes_  = 0;  // down.weight_scale [hd, inter/16] F8
+    // NVFP4 per-MoE-expert layout sizes (bytes) — uses moe_intermediate_dim
+    size_t nvfp4_gate_w_bytes_  = 0;  // gate.weight [moe_inter, hd/2] U8
+    size_t nvfp4_gate_s_bytes_  = 0;  // gate.weight_scale [moe_inter, hd/16] F8
+    size_t nvfp4_up_w_bytes_    = 0;
+    size_t nvfp4_up_s_bytes_    = 0;
+    size_t nvfp4_down_w_bytes_  = 0;  // down.weight [hd, moe_inter/2] U8
+    size_t nvfp4_down_s_bytes_  = 0;
+
+    // NVFP4 dense FFN sizes — uses intermediate_dim (18432 for Kimi K2.5)
+    size_t nvfp4_dense_gate_w_bytes_ = 0;
+    size_t nvfp4_dense_gate_s_bytes_ = 0;
+    size_t nvfp4_dense_up_w_bytes_   = 0;
+    size_t nvfp4_dense_up_s_bytes_   = 0;
+    size_t nvfp4_dense_down_w_bytes_ = 0;
+    size_t nvfp4_dense_down_s_bytes_ = 0;
+    size_t nvfp4_dense_ffn_bytes_    = 0;  // total per dense layer
 
     // CPU-side buffer for loading one expert at a time (pinned, host memory)
     void* nvfp4_load_buf_ = nullptr;

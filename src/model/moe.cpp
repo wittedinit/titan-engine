@@ -43,6 +43,7 @@ MoEExecutor::~MoEExecutor() {
         if (ms.shared_gate_proj) cudaFree(ms.shared_gate_proj);
         if (ms.shared_up_proj) cudaFree(ms.shared_up_proj);
         if (ms.shared_down_proj) cudaFree(ms.shared_down_proj);
+        // dense_ffn_buf is VRAM-pool backed — do not cudaFree (pool owns it)
     }
     moe_state_.clear();
 
@@ -95,9 +96,12 @@ void MoEExecutor::allocate_buffers() {
     cudaMalloc(&expert_weight_buf_[0], expert_weight_buf_size_);
     cudaMalloc(&expert_weight_buf_[1], expert_weight_buf_size_);
 
-    // Pre-allocate expert activation scratch
-    cudaMalloc(&expert_gate_out_, moe_inter * sizeof(float));
-    cudaMalloc(&expert_up_out_, moe_inter * sizeof(float));
+    // Pre-allocate expert activation scratch — size to max of MoE inter and dense inter
+    // so the same buffers can be reused for both MoE experts and dense FFN layers.
+    uint32_t dense_inter = config_.intermediate_dim > 0 ? config_.intermediate_dim : moe_inter;
+    uint32_t max_inter = std::max(moe_inter, dense_inter);
+    cudaMalloc(&expert_gate_out_, max_inter * sizeof(float));
+    cudaMalloc(&expert_up_out_,   max_inter * sizeof(float));
     cudaMalloc(&shared_gate_out_, moe_inter * sizeof(float));
     cudaMalloc(&shared_up_out_, moe_inter * sizeof(float));
 
@@ -198,8 +202,8 @@ bool MoEExecutor::initialize(const std::string& model_path,
     has_nvfp4_ = has_nvfp4;
 
     if (has_nvfp4_) {
-        // gate/up: [moe_inter, hd/2] U8, scale: [moe_inter, hd/16] F8
-        // down:    [hd, moe_inter/2] U8, scale: [hd, moe_inter/16] F8
+        // MoE expert layout: gate/up [moe_inter, hd/2] U8, scale [moe_inter, hd/16] F8
+        //                    down    [hd, moe_inter/2] U8, scale [hd, moe_inter/16] F8
         nvfp4_gate_w_bytes_ = (size_t)moe_inter * (hd / 2);
         nvfp4_gate_s_bytes_ = (size_t)moe_inter * (hd / 16);
         nvfp4_up_w_bytes_   = nvfp4_gate_w_bytes_;
@@ -209,8 +213,25 @@ bool MoEExecutor::initialize(const std::string& model_path,
         expert_bytes_ = nvfp4_gate_w_bytes_ + nvfp4_gate_s_bytes_ + sizeof(float)
                       + nvfp4_up_w_bytes_   + nvfp4_up_s_bytes_   + sizeof(float)
                       + nvfp4_down_w_bytes_ + nvfp4_down_s_bytes_ + sizeof(float);
-        // Pinned host buffer for loading one expert from safetensors
-        cudaMallocHost(&nvfp4_load_buf_, expert_bytes_);
+
+        // Dense FFN layout: gate/up [dense_inter, hd/2] U8, scale [dense_inter, hd/16] F8
+        //                   down    [hd, dense_inter/2] U8, scale [hd, dense_inter/16] F8
+        uint32_t dense_inter = config_.intermediate_dim > 0 ? config_.intermediate_dim : moe_inter;
+        nvfp4_dense_gate_w_bytes_ = (size_t)dense_inter * (hd / 2);
+        nvfp4_dense_gate_s_bytes_ = (size_t)dense_inter * (hd / 16);
+        nvfp4_dense_up_w_bytes_   = nvfp4_dense_gate_w_bytes_;
+        nvfp4_dense_up_s_bytes_   = nvfp4_dense_gate_s_bytes_;
+        nvfp4_dense_down_w_bytes_ = (size_t)hd * (dense_inter / 2);
+        nvfp4_dense_down_s_bytes_ = (size_t)hd * (dense_inter / 16);
+        nvfp4_dense_ffn_bytes_    = nvfp4_dense_gate_w_bytes_ + nvfp4_dense_gate_s_bytes_ + sizeof(float)
+                                  + nvfp4_dense_up_w_bytes_   + nvfp4_dense_up_s_bytes_   + sizeof(float)
+                                  + nvfp4_dense_down_w_bytes_ + nvfp4_dense_down_s_bytes_ + sizeof(float);
+        LOG_INFO("NVFP4 sizes: expert=%.1f MB, dense_ffn=%.1f MB",
+                 expert_bytes_ / 1e6, nvfp4_dense_ffn_bytes_ / 1e6);
+
+        // Pinned host buffer sized for whichever is larger (dense FFN or one expert)
+        size_t staging_size = std::max(expert_bytes_, nvfp4_dense_ffn_bytes_);
+        cudaMallocHost(&nvfp4_load_buf_, staging_size);
     } else {
         expert_bytes_ = 3 * (size_t)moe_inter * hd * sizeof(float);
     }
@@ -392,10 +413,65 @@ bool MoEExecutor::initialize(const std::string& model_path,
             : hd * qkv * sizeof(float);
         try_load(lp + ".self_attn.o_proj.weight", aw.o_proj, o_buf_bytes);
 
-        // Routing gate
-        cudaMalloc(&ms.gate_weight, config_.num_experts * hd * sizeof(float));
-        cudaMemset(ms.gate_weight, 0, config_.num_experts * hd * sizeof(float));
-        try_load(lp + ".mlp.gate.weight", ms.gate_weight, config_.num_experts * hd * sizeof(float));
+        // Dense layer detection: first_k_dense_replace layers use a standard FFN (no experts)
+        bool is_dense_layer = (config_.first_k_dense_replace > 0 && l < config_.first_k_dense_replace);
+        ms.is_dense = is_dense_layer;
+
+        if (is_dense_layer) {
+            // Dense FFN: load gate/up/down NVFP4 weights into GPU memory eagerly
+            if (has_nvfp4 && nvfp4_dense_ffn_bytes_ > 0 && nvfp4_load_buf_) {
+                uint32_t di = config_.intermediate_dim > 0 ? config_.intermediate_dim : moe_inter;
+                std::string pfx = lp + ".mlp.";
+                // Reuse load_nvfp4_expert logic inline with dense tensor names
+                uint8_t* cpu = (uint8_t*)nvfp4_load_buf_;
+                size_t off = 0;
+                auto rdns = [&](const std::string& name, size_t sz) -> bool {
+                    if (!loader.has_tensor(name)) { memset(cpu+off, 0, sz); return true; }
+                    return loader.read_tensor_cpu(name, cpu+off, sz) == (ssize_t)sz;
+                };
+                auto rdg = [&](const std::string& name) -> bool {
+                    if (!loader.has_tensor(name)) { float one=1.f; memcpy(cpu+off,&one,4); return true; }
+                    auto meta = loader.get_meta(name);
+                    if (meta.byte_size() == 2) {
+                        uint16_t bf16=0; loader.read_tensor_cpu(name,&bf16,2);
+                        uint32_t f32bits=(uint32_t)bf16<<16; memcpy(cpu+off,&f32bits,4); return true;
+                    }
+                    return loader.read_tensor_cpu(name,cpu+off,4)==4;
+                };
+                bool ok = rdns(pfx+"gate_proj.weight", nvfp4_dense_gate_w_bytes_); off+=nvfp4_dense_gate_w_bytes_;
+                ok = ok && rdns(pfx+"gate_proj.weight_scale", nvfp4_dense_gate_s_bytes_); off+=nvfp4_dense_gate_s_bytes_;
+                ok = ok && rdg(pfx+"gate_proj.weight_scale_2"); off+=sizeof(float);
+                ok = ok && rdns(pfx+"up_proj.weight", nvfp4_dense_up_w_bytes_); off+=nvfp4_dense_up_w_bytes_;
+                ok = ok && rdns(pfx+"up_proj.weight_scale", nvfp4_dense_up_s_bytes_); off+=nvfp4_dense_up_s_bytes_;
+                ok = ok && rdg(pfx+"up_proj.weight_scale_2"); off+=sizeof(float);
+                ok = ok && rdns(pfx+"down_proj.weight", nvfp4_dense_down_w_bytes_); off+=nvfp4_dense_down_w_bytes_;
+                ok = ok && rdns(pfx+"down_proj.weight_scale", nvfp4_dense_down_s_bytes_); off+=nvfp4_dense_down_s_bytes_;
+                ok = ok && rdg(pfx+"down_proj.weight_scale_2"); off+=sizeof(float);
+                if (ok) {
+                    // Read global scales from CPU staging before GPU transfer
+                    size_t gate_g_off = nvfp4_dense_gate_w_bytes_ + nvfp4_dense_gate_s_bytes_;
+                    size_t up_g_off   = gate_g_off + 4 + nvfp4_dense_up_w_bytes_ + nvfp4_dense_up_s_bytes_;
+                    size_t down_g_off = up_g_off   + 4 + nvfp4_dense_down_w_bytes_ + nvfp4_dense_down_s_bytes_;
+                    memcpy(&ms.dense_gate_g, cpu + gate_g_off, 4);
+                    memcpy(&ms.dense_up_g,   cpu + up_g_off,   4);
+                    memcpy(&ms.dense_down_g, cpu + down_g_off, 4);
+                    ms.dense_ffn_buf = memory_->vram_alloc(nvfp4_dense_ffn_bytes_);
+                    if (ms.dense_ffn_buf) {
+                        cudaMemcpy(ms.dense_ffn_buf, nvfp4_load_buf_, nvfp4_dense_ffn_bytes_, cudaMemcpyHostToDevice);
+                        LOG_INFO("Dense FFN layer %u: loaded %.1f MB (g=%.5f, u=%.5f, d=%.5f)",
+                                 l, nvfp4_dense_ffn_bytes_/1e6,
+                                 ms.dense_gate_g, ms.dense_up_g, ms.dense_down_g);
+                    }
+                }
+            }
+            // Dense layers have no routing gate — skip gate_weight alloc
+            ms.gate_weight = nullptr;
+        } else {
+            // Routing gate
+            cudaMalloc(&ms.gate_weight, config_.num_experts * hd * sizeof(float));
+            cudaMemset(ms.gate_weight, 0, config_.num_experts * hd * sizeof(float));
+            try_load(lp + ".mlp.gate.weight", ms.gate_weight, config_.num_experts * hd * sizeof(float));
+        }
 
         // Shared expert — only allocate FP32 buffers for non-NVFP4 models.
         // NVFP4 shared experts (mlp.shared_experts.*) are U8 format and can't
@@ -684,8 +760,34 @@ void MoEExecutor::forward_layer(float* hidden, float* residual,
         cuda::vector_add(residual, residual, o_tmp, hd, stream);
     }
 
-    // ======= MoE FFN =======
+    // ======= FFN (MoE or Dense) =======
     cuda::rmsnorm(norm_buf_, residual, aw.ffn_norm, hd, 1e-5f, stream);
+
+    // Dense layer path (first_k_dense_replace layers use a standard FFN, not MoE)
+    if (ms.is_dense) {
+        if (ms.dense_ffn_buf && has_nvfp4_) {
+            uint32_t di = config_.intermediate_dim > 0 ? config_.intermediate_dim : moe_inter;
+            const uint8_t* d_gate_w = (const uint8_t*)ms.dense_ffn_buf;
+            const uint8_t* d_gate_s = d_gate_w + nvfp4_dense_gate_w_bytes_;
+            const uint8_t* d_up_w   = d_gate_s + nvfp4_dense_gate_s_bytes_ + sizeof(float);
+            const uint8_t* d_up_s   = d_up_w   + nvfp4_dense_up_w_bytes_;
+            const uint8_t* d_down_w = d_up_s   + nvfp4_dense_up_s_bytes_   + sizeof(float);
+            const uint8_t* d_down_s = d_down_w + nvfp4_dense_down_w_bytes_;
+
+            cuda::dequant_matvec_nvfp4(d_gate_w, d_gate_s, ms.dense_gate_g,
+                                        norm_buf_, expert_gate_out_, di, hd, stream);
+            cuda::dequant_matvec_nvfp4(d_up_w,   d_up_s,   ms.dense_up_g,
+                                        norm_buf_, expert_up_out_,   di, hd, stream);
+            cuda::swiglu(expert_gate_out_, expert_gate_out_, expert_up_out_, di, stream);
+            cuda::dequant_matvec_nvfp4(d_down_w, d_down_s, ms.dense_down_g,
+                                        expert_gate_out_, hidden, hd, di, stream);
+            // Add to residual
+            cuda::vector_add(residual, residual, hidden, hd, stream);
+            cuda::vector_copy(hidden, residual, hd, stream);
+        }
+        // else: no dense FFN weights loaded → skip (residual passes unchanged)
+        return;
+    }
 
     // Routing
     cuda::moe_gate(norm_buf_, ms.gate_weight, gate_logits_, hd, config_.num_experts, stream);
