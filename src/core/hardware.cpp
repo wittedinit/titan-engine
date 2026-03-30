@@ -282,8 +282,11 @@ HardwareProfile detect_hardware() {
 size_t HardwareProfile::optimal_vram_budget() const {
     if (gpus.empty()) return 0;
     size_t vram = gpus[0].vram_free;
-    size_t reserved = 512ULL * 1024 * 1024;
-    return vram > reserved ? (size_t)((vram - reserved) * 0.9) : 0;
+    // Reserve 256 MB for CUDA context and driver overhead.
+    // Use 95% of the remainder — leaves ~1.5 GB headroom on a 32 GB GPU
+    // while fitting large models like Kimi K2.5 (1T MoE, ~31 GB of fixed weights).
+    size_t reserved = 256ULL * 1024 * 1024;
+    return vram > reserved ? (size_t)((vram - reserved) * 0.95) : 0;
 }
 
 size_t HardwareProfile::optimal_ram_budget() const {
