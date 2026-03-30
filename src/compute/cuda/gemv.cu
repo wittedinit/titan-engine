@@ -111,8 +111,8 @@ void gemv_bf16_to_fp32(
                  y, CUDA_R_32F, rows,
                  CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     if (status != CUBLAS_STATUS_SUCCESS) {
-        LOG_ERROR("gemv_bf16_to_fp32: cublasGemmEx failed with status %d (rows=%d cols=%d)",
-                  (int)status, rows, cols);
+        fprintf(stderr, "[ERROR] gemv_bf16_to_fp32: cublasGemmEx failed status=%d (rows=%d cols=%d)\n",
+                (int)status, rows, cols);
     }
 }
 
