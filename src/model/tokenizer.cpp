@@ -553,45 +553,89 @@ std::vector<int> Tokenizer::encode_tiktoken(const std::string& text, bool add_bo
 
     if (text.empty()) return result;
 
-    // Pre-tokenize: split into pieces using simple character-class boundaries.
-    // The piece includes any leading whitespace (space attaches to the following word).
+    // Step 0: Split text on special tokens (e.g. <|im_user|>, <|im_end|>).
+    // Special tokens are matched literally and emitted as single token IDs;
+    // the text between them is BPE-encoded normally.
+    // Build sorted list of special tokens (longest first for greedy match)
+    std::vector<std::pair<std::string,int>> specials;
+    for (const auto& [sid, _] : special_ids_) {
+        if (sid >= 0 && sid < (int)id_to_token_.size()) {
+            const auto& s = id_to_token_[sid];
+            if (s.size() > 1) specials.push_back({s, sid});
+        }
+    }
+    std::sort(specials.begin(), specials.end(),
+              [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
+
+    // Split text into segments: either a special token ID or a text chunk to BPE-encode
+    struct Segment { std::string text; int token_id; /* -1 = BPE text, >=0 = special */ };
+    std::vector<Segment> segments;
+    {
+        size_t pos = 0;
+        while (pos < text.size()) {
+            bool found = false;
+            for (const auto& [sp, sid] : specials) {
+                if (text.compare(pos, sp.size(), sp) == 0) {
+                    segments.push_back({"", sid});
+                    pos += sp.size();
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                if (segments.empty() || segments.back().token_id >= 0)
+                    segments.push_back({std::string(1, text[pos]), -1});
+                else
+                    segments.back().text += text[pos];
+                pos++;
+            }
+        }
+    }
+
+    // Encode each segment
+    for (const auto& seg : segments) {
+        if (seg.token_id >= 0) {
+            result.push_back(seg.token_id);
+            continue;
+        }
+        // BPE-encode the text segment (below)
+        const std::string& seg_text = seg.text;
+        if (seg_text.empty()) continue;
+
+    // Pre-tokenize seg_text into pieces using simple character-class boundaries.
     std::vector<std::string> pieces;
     size_t i = 0;
-    while (i < text.size()) {
+    while (i < seg_text.size()) {
         std::string piece;
 
         // Collect leading whitespace/newlines
-        while (i < text.size() && (uint8_t)text[i] <= 0x20) {
-            piece += text[i++];
+        while (i < seg_text.size() && (uint8_t)seg_text[i] <= 0x20) {
+            piece += seg_text[i++];
         }
-        if (i >= text.size()) {
+        if (i >= seg_text.size()) {
             if (!piece.empty()) pieces.push_back(piece);
             break;
         }
 
-        unsigned char c = (unsigned char)text[i];
+        unsigned char c = (unsigned char)seg_text[i];
         if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0x80) {
-            // Letter or multi-byte UTF-8 start — collect whole UTF-8 word
-            while (i < text.size()) {
-                unsigned char ch = (unsigned char)text[i];
+            while (i < seg_text.size()) {
+                unsigned char ch = (unsigned char)seg_text[i];
                 if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch >= 0x80) {
-                    // handle multi-byte
                     int len = 1;
                     if (ch >= 0xF0) len = 4;
                     else if (ch >= 0xE0) len = 3;
                     else if (ch >= 0xC0) len = 2;
-                    for (int k = 0; k < len && i < text.size(); k++) piece += text[i++];
+                    for (int k = 0; k < len && i < seg_text.size(); k++) piece += seg_text[i++];
                 } else {
                     break;
                 }
             }
         } else if (c >= '0' && c <= '9') {
-            // Digit run
-            while (i < text.size() && (unsigned char)text[i] >= '0' && (unsigned char)text[i] <= '9')
-                piece += text[i++];
+            while (i < seg_text.size() && (unsigned char)seg_text[i] >= '0' && (unsigned char)seg_text[i] <= '9')
+                piece += seg_text[i++];
         } else {
-            // Single punctuation / other
-            piece += text[i++];
+            piece += seg_text[i++];
         }
 
         if (!piece.empty()) pieces.push_back(piece);
@@ -602,6 +646,8 @@ std::vector<int> Tokenizer::encode_tiktoken(const std::string& text, bool add_bo
         auto ids = tiktoken_bpe_word(piece);
         result.insert(result.end(), ids.begin(), ids.end());
     }
+
+    } // end segment loop
 
     return result;
 }
