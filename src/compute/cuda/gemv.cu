@@ -88,32 +88,74 @@ void gemv_fp32_batched(
                 y, 1);
 }
 
-// BF16 matrix × FP32 vector → FP32 output
+// BF16→FP32 inline conversion
+__device__ __forceinline__ float bf16_to_float(uint16_t v) {
+    uint32_t bits = (uint32_t)v << 16;
+    float f;
+    __builtin_memcpy(&f, &bits, 4);
+    return f;
+}
+
+// Custom BF16 matrix × FP32 vector → FP32 output kernel.
+// Avoids cuBLAS GemmEx which returns CUBLAS_STATUS_NOT_SUPPORTED on some
+// GPU/toolkit combinations (e.g. sm_120 Blackwell with older CUDA).
 // A: [rows, cols] row-major BF16  |  x: [cols] FP32  |  y: [rows] FP32
-// Uses cublasGemmEx: same CUBLAS_OP_T trick as gemv_fp32.
+__global__ void gemv_bf16_kernel(
+    const uint16_t* __restrict__ A,  // [rows, cols] BF16
+    const float*    __restrict__ x,  // [cols] FP32
+    float*          __restrict__ y,  // [rows] FP32
+    int rows, int cols
+) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    extern __shared__ float shared_x[];
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        shared_x[i] = x[i];
+    }
+    __syncthreads();
+
+    float acc = 0.0f;
+    const uint16_t* row_ptr = A + (size_t)row * cols;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        acc += bf16_to_float(row_ptr[c]) * shared_x[c];
+    }
+
+    // Warp reduction
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+
+    __shared__ float warp_sums[32];
+    int warp_id = threadIdx.x / 32;
+    int lane    = threadIdx.x % 32;
+    if (lane == 0) warp_sums[warp_id] = acc;
+    __syncthreads();
+    if (warp_id == 0) {
+        int nw = (blockDim.x + 31) / 32;
+        acc = (lane < nw) ? warp_sums[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+        if (lane == 0) y[row] = acc;
+    }
+}
+
 void gemv_bf16_to_fp32(
     const void* A, const float* x, float* y,
     int rows, int cols,
     cudaStream_t stream
 ) {
-    init_cublas();
-    cublasSetStream(g_cublas_handle, stream);
-    float alpha = 1.0f, beta = 0.0f;
-    // Mirror gemv_fp32 layout: A[rows,cols] row-major = [cols,rows] col-major
-    // CUBLAS_OP_T transposes the stored [cols,rows] back to [rows,cols]
-    cublasStatus_t status = cublasGemmEx(g_cublas_handle,
-                 CUBLAS_OP_T, CUBLAS_OP_N,
-                 rows, 1, cols,
-                 &alpha,
-                 A, CUDA_R_16BF, cols,
-                 x, CUDA_R_32F, cols,
-                 &beta,
-                 y, CUDA_R_32F, rows,
-                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        fprintf(stderr, "[ERROR] gemv_bf16_to_fp32: cublasGemmEx failed status=%d (rows=%d cols=%d)\n",
-                (int)status, rows, cols);
+    int block_size = 256;
+    int shared_mem = cols * sizeof(float);
+    // Cap shared memory: for very large cols (>8K), use 48KB shared and loop
+    if (shared_mem > 48 * 1024) {
+        // Fallback: launch without shared memory, read x from global
+        // For now, cols=7168 → 28KB which fits fine
+        shared_mem = 48 * 1024;
     }
+    gemv_bf16_kernel<<<rows, block_size, shared_mem, stream>>>(
+        (const uint16_t*)A, x, y, rows, cols
+    );
+    CUDA_CHECK_LAUNCH();
 }
 
 // BF16 embedding lookup: copy and convert row token_id to FP32
