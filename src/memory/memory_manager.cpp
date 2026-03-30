@@ -20,7 +20,7 @@ MemoryManager::MemoryManager(const HardwareProfile& hw, const RuntimeConfig& cfg
     }
 
     ram_ = std::make_unique<RamPool>(ram_budget);
-    LOG_INFO("RAM pool: %.1f GB (pinned)", ram_budget / 1e9);
+    LOG_INFO("RAM pool: %.1f GB budget (demand-allocated, not reserved upfront)", ram_budget / 1e9);
 
     std::string nvme_path = cfg.nvme_cache_path.empty() ? cfg.model_path : cfg.nvme_cache_path;
     nvme_ = std::make_unique<NvmePool>(nvme_path, cfg.nvme_cache_mb * 1024ULL * 1024);
