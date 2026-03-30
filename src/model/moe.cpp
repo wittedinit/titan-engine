@@ -145,43 +145,8 @@ bool MoEExecutor::initialize(const std::string& model_path,
     uint32_t kv_cache_head_dim = config_.has_mla && config_.nope_head_dim > 0
                                   ? config_.nope_head_dim
                                   : config_.head_dim;
-
-    // Allocate KV cache from the VRAM pool so it doesn't compete with cudaMalloc.
-    // Budget = whatever the VRAM pool can still spare after the pool itself was
-    // created (pool was sized to free_vram * 0.9 at hardware-detect time).
-    // KV cache = 2 × layers × kv_heads × head_dim × ctx × sizeof(float).
-    {
-        size_t pool_free = memory_ ? memory_->vram_free_bytes() : 0;
-        LOG_INFO("VRAM pool free at KV cache init: %.1f MB", pool_free / 1e6);
-
-        size_t kv_per_ctx = 2ULL * config_.num_layers * config_.num_kv_heads
-                            * kv_cache_head_dim * sizeof(float);
-        // Leave 512 MB in the pool for attention scratch and other buffers
-        size_t kv_budget = (pool_free > (size_t)512 << 20) ? pool_free - ((size_t)512 << 20) : 0;
-        uint32_t max_ctx_by_pool = (kv_per_ctx > 0 && kv_budget > 0)
-                                   ? (uint32_t)(kv_budget / kv_per_ctx)
-                                   : 512u;
-        uint32_t capped_ctx = std::min(runtime.max_context_len, std::max(512u, max_ctx_by_pool));
-        if (capped_ctx < runtime.max_context_len) {
-            LOG_WARN("KV cache: capping context from %u to %u (%.1f MB pool budget)",
-                     runtime.max_context_len, capped_ctx, kv_budget / 1e6);
-        }
-
-        size_t kv_bytes = (size_t)config_.num_layers * (size_t)capped_ctx
-                          * config_.num_kv_heads * kv_cache_head_dim * sizeof(float);
-        float* k_buf = (float*)memory_->vram_alloc(kv_bytes);
-        float* v_buf = (float*)memory_->vram_alloc(kv_bytes);
-
-        if (!k_buf || !v_buf) {
-            LOG_ERROR("KV cache: failed to allocate %.1f MB from VRAM pool (pool_free=%.1f MB)",
-                      kv_bytes * 2 / 1e6, pool_free / 1e6);
-            return false;
-        }
-
-        if (!kv_cache_.initialize_external(config_.num_layers, config_.num_kv_heads,
-                                            kv_cache_head_dim, capped_ctx, k_buf, v_buf))
-            return false;
-    }
+    // NOTE: KV cache is allocated AFTER model weights + scratch buffers so the
+    // budget calculation reflects actual remaining VRAM.  (See alloc at end of init.)
 
     loader_ = std::make_unique<ModelLoader>();
     if (!loader_->load(model_path)) return false;
@@ -504,6 +469,48 @@ bool MoEExecutor::initialize(const std::string& model_path,
     // expert_bytes_ already set above (NVFP4 or FP32 layout)
 
     allocate_buffers();
+
+    // Allocate KV cache with whatever VRAM remains after model weights + scratch buffers.
+    // Doing this last ensures the budget is accurate — on large models like Kimi K2.5,
+    // fixed attention weights consume ~28 GB, leaving only ~1-2 GB for the KV cache.
+    // With MLA's expanded KV representation (num_kv_heads × nope_head_dim per position),
+    // each context position costs 2 × num_layers × num_kv_heads × nope_head_dim × 4 bytes.
+    {
+        size_t pool_free = memory_ ? memory_->vram_free_bytes() : 0;
+        LOG_INFO("VRAM pool free for KV cache (after weights): %.1f MB", pool_free / 1e6);
+
+        size_t kv_per_ctx = 2ULL * config_.num_layers * config_.num_kv_heads
+                            * kv_cache_head_dim * sizeof(float);
+        // Leave 256 MB headroom for inference scratch buffers in engine.cpp
+        size_t kv_budget = (pool_free > 256ULL << 20) ? pool_free - (256ULL << 20) : 0;
+        uint32_t max_ctx_by_pool = (kv_per_ctx > 0 && kv_budget > 0)
+                                   ? (uint32_t)(kv_budget / kv_per_ctx)
+                                   : 0u;
+        uint32_t capped_ctx = std::min(runtime.max_context_len,
+                                        std::max(128u, max_ctx_by_pool));
+        if (capped_ctx < runtime.max_context_len) {
+            LOG_WARN("KV cache: capping context from %u to %u (%.1f MB free after weights)",
+                     runtime.max_context_len, capped_ctx, pool_free / 1e6);
+        }
+
+        size_t kv_bytes = (size_t)config_.num_layers * (size_t)capped_ctx
+                          * config_.num_kv_heads * kv_cache_head_dim * sizeof(float);
+        float* k_buf = (float*)memory_->vram_alloc(kv_bytes);
+        float* v_buf = (float*)memory_->vram_alloc(kv_bytes);
+
+        if (!k_buf || !v_buf) {
+            LOG_ERROR("KV cache: failed to allocate %.1f MB from VRAM pool (pool_free=%.1f MB)",
+                      kv_bytes * 2 / 1e6, pool_free / 1e6);
+            return false;
+        }
+
+        LOG_INFO("KV cache: %u positions × %.1f MB/pos = %.1f MB total",
+                 capped_ctx, kv_per_ctx / 1e6, kv_bytes * 2 / 1e6);
+
+        if (!kv_cache_.initialize_external(config_.num_layers, config_.num_kv_heads,
+                                            kv_cache_head_dim, capped_ctx, k_buf, v_buf))
+            return false;
+    }
 
     LOG_INFO("MoE executor ready: %s (%uL, %u experts, K=%u, shared=%u)",
              config_.name.c_str(), config_.num_layers,
