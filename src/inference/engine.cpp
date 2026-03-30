@@ -226,8 +226,8 @@ void InferenceEngine::generate(const std::string& prompt,
             // Log first few logit values for diagnostics
             float logit_sample[4] = {};
             cudaMemcpy(logit_sample, logits, 4 * sizeof(float), cudaMemcpyDeviceToHost);
-            LOG_DEBUG("logits[0..3] = %.4f %.4f %.4f %.4f",
-                      logit_sample[0], logit_sample[1], logit_sample[2], logit_sample[3]);
+            LOG_INFO("logits[0..3] = %.4f %.4f %.4f %.4f",
+                     logit_sample[0], logit_sample[1], logit_sample[2], logit_sample[3]);
         }
 
         // Sample next token
