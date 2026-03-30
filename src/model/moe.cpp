@@ -942,13 +942,43 @@ void MoEExecutor::forward_layer(float* hidden, float* residual,
 void MoEExecutor::compute_logits(const float* hidden, float* logits,
                                   cudaStream_t cuda_stream) {
     cudaStream_t stream = cuda_stream;
-    cuda::rmsnorm(norm_buf_, hidden, final_norm_, config_.hidden_dim, 1e-5f, stream);
+    uint32_t hd = config_.hidden_dim;
+    uint32_t vocab = config_.vocab_size;
+
+    cuda::rmsnorm(norm_buf_, hidden, final_norm_, hd, 1e-5f, stream);
+    cudaDeviceSynchronize();
+
+    // Diagnostic: check norm_buf after rmsnorm
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        float nb[4] = {}, fn[4] = {};
+        cudaMemcpy(nb, norm_buf_, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(fn, final_norm_, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+        float nb_sum = 0;
+        std::vector<float> nb_all(hd);
+        cudaMemcpy(nb_all.data(), norm_buf_, hd * sizeof(float), cudaMemcpyDeviceToHost);
+        for (auto v : nb_all) nb_sum += (v > 0 ? v : -v);
+        LOG_INFO("compute_logits: norm_buf[0..3] = %.6f %.6f %.6f %.6f (L1=%.1f)",
+                 nb[0], nb[1], nb[2], nb[3], nb_sum);
+        LOG_INFO("compute_logits: final_norm[0..3] = %.6f %.6f %.6f %.6f", fn[0], fn[1], fn[2], fn[3]);
+        LOG_INFO("compute_logits: lm_head=%p norm_buf=%p embedding_is_bf16=%d vocab=%u hd=%u",
+                 lm_head_, (void*)norm_buf_, (int)embedding_is_bf16_, vocab, hd);
+
+        // Check a few lm_head weights
+        if (embedding_is_bf16_ && lm_head_) {
+            uint16_t lm_sample[8] = {};
+            cudaMemcpy(lm_sample, lm_head_, 8 * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+            LOG_INFO("compute_logits: lm_head_bf16[0..7] = %04x %04x %04x %04x %04x %04x %04x %04x",
+                     lm_sample[0], lm_sample[1], lm_sample[2], lm_sample[3],
+                     lm_sample[4], lm_sample[5], lm_sample[6], lm_sample[7]);
+        }
+    }
+
     if (embedding_is_bf16_) {
-        cuda::gemv_bf16_to_fp32(lm_head_, norm_buf_, logits,
-                                config_.vocab_size, config_.hidden_dim, stream);
+        cuda::gemv_bf16_to_fp32(lm_head_, norm_buf_, logits, vocab, hd, stream);
     } else {
-        cuda::gemv_fp32((const float*)lm_head_, norm_buf_, logits,
-                        config_.vocab_size, config_.hidden_dim, stream);
+        cuda::gemv_fp32((const float*)lm_head_, norm_buf_, logits, vocab, hd, stream);
     }
 }
 
