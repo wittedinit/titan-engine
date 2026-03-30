@@ -209,6 +209,7 @@ void InferenceEngine::generate(const std::string& prompt,
     }
 
     int tokens_generated = 0;
+    std::vector<int> generated_token_ids;
     auto t_decode_start = std::chrono::steady_clock::now();
 
     for (uint32_t step = 0; step < sampling.max_tokens; step++) {
@@ -255,6 +256,25 @@ void InferenceEngine::generate(const std::string& prompt,
             model_->compute_logits(hidden, logits, nullptr);
         }
 
+        // Apply repetition penalty: penalize previously generated tokens
+        if (sampling.repetition_penalty > 1.0f && tokens_generated > 0) {
+            // Copy penalty token IDs to GPU and apply
+            // For simplicity, apply on CPU (logits D→H, modify, H→D)
+            // This is acceptable since vocab×4 bytes is only ~640KB
+            std::vector<float> lg(cfg.vocab_size);
+            cudaMemcpy(lg.data(), logits, cfg.vocab_size * sizeof(float), cudaMemcpyDeviceToHost);
+            // Penalize all previously generated tokens + prompt tokens
+            std::vector<int> all_prev = prompt_tokens;
+            // (generated_tokens collected below in the token callback)
+            for (int t : generated_token_ids) {
+                if (t >= 0 && t < (int)cfg.vocab_size) {
+                    if (lg[t] > 0) lg[t] /= sampling.repetition_penalty;
+                    else            lg[t] *= sampling.repetition_penalty;
+                }
+            }
+            cudaMemcpy(logits, lg.data(), cfg.vocab_size * sizeof(float), cudaMemcpyHostToDevice);
+        }
+
         // Sample next token
         cuda::sample_token(logits, sampled_token_gpu, cfg.vocab_size,
                           sampling.temperature, sampling.top_p, sampling.top_k,
@@ -283,6 +303,7 @@ void InferenceEngine::generate(const std::string& prompt,
         }
 
         tokens_generated++;
+        generated_token_ids.push_back(token_id);
 
         // Decode and callback
         std::string text = tokenizer_.decode(token_id);
