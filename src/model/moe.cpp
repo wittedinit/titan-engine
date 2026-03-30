@@ -271,8 +271,38 @@ bool MoEExecutor::initialize(const std::string& model_path,
             }
         };
 
-        try_load(lp + ".input_layernorm.weight", aw.attn_norm, hd * sizeof(float));
-        try_load(lp + ".post_attention_layernorm.weight", aw.ffn_norm, hd * sizeof(float));
+        // Norm weights: load as FP32, converting from BF16/FP16 if needed.
+        // try_load does a raw byte copy — wrong for BF16 norms into FP32 buffers.
+        auto load_norm_fp32_early = [&](const std::string& name, float* dst, size_t n_elems) {
+            if (!loader.has_tensor(name)) return;
+            auto meta = loader.get_meta(name);
+            if ((size_t)meta.numel() > n_elems) return;
+            if (meta.dtype == DType::FP32) {
+                // Already FP32 — raw copy is fine
+                loader.read_tensor_gpu(name, dst, meta.byte_size());
+                return;
+            }
+            // BF16 or FP16 on disk → convert to FP32
+            std::vector<uint16_t> raw(meta.numel());
+            loader.read_tensor_cpu(name, raw.data(), meta.byte_size());
+            std::vector<float> fp32(meta.numel());
+            bool is_bf16 = (meta.dtype == DType::BF16);
+            for (size_t i = 0; i < (size_t)meta.numel(); i++) {
+                uint16_t h = raw[i];
+                uint32_t v = is_bf16 ? ((uint32_t)h << 16)
+                                     : [&]() -> uint32_t {
+                                         uint32_t s=(h>>15)&1, e=(h>>10)&0x1F, m=h&0x3FF;
+                                         if (e==0) return (s<<31)|((m==0)?0u:(uint32_t)((127-14)<<23)|(m<<13));
+                                         if (e==31) return (s<<31)|0x7F800000|(m<<13);
+                                         return (s<<31)|((e+127-15)<<23)|(m<<13);
+                                       }();
+                memcpy(&fp32[i], &v, 4);
+            }
+            cudaMemcpy(dst, fp32.data(), meta.numel() * sizeof(float), cudaMemcpyHostToDevice);
+        };
+
+        load_norm_fp32_early(lp + ".input_layernorm.weight",        aw.attn_norm, hd);
+        load_norm_fp32_early(lp + ".post_attention_layernorm.weight", aw.ffn_norm, hd);
 
         // Attention — MLA models don't use standard q/k/v projections; skip those allocs
         // to avoid wasting ~400MB × 3 per layer (73 GB for a 61-layer model).
