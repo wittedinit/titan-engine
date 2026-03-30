@@ -89,8 +89,8 @@ void MoEExecutor::allocate_buffers() {
     } else {
         expert_weight_buf_size_ = 3 * (size_t)moe_inter * hd * sizeof(float);
     }
-    expert_weight_buf_[0] = va(expert_weight_buf_size_);
-    expert_weight_buf_[1] = va(expert_weight_buf_size_);
+    expert_weight_buf_[0] = (float*)va(expert_weight_buf_size_);
+    expert_weight_buf_[1] = (float*)va(expert_weight_buf_size_);
 
     // Pre-allocate expert activation scratch — size to max of MoE inter and dense inter
     // so the same buffers can be reused for both MoE experts and dense FFN layers.
@@ -108,17 +108,15 @@ void MoEExecutor::allocate_buffers() {
 
 void MoEExecutor::free_buffers() {
     if (!memory_) return;
-    auto sf = [this](void*& p) { if (p) { memory_->vram_free(p); p = nullptr; } };
-    auto sff = [this](float*& p) { if (p) { memory_->vram_free(p); p = nullptr; } };
-    auto sfi = [this](int*& p) { if (p) { memory_->vram_free(p); p = nullptr; } };
-    sff(q_buf_); sff(k_buf_); sff(v_buf_); sff(attn_out_); sff(norm_buf_);
-    sff(gate_logits_); sff(routing_weights_); sfi(routing_indices_);
-    sff(expert_outputs_); sff(shared_out_);
+    auto sf = [this](auto*& p) { if (p) { memory_->vram_free((void*)p); p = nullptr; } };
+    sf(q_buf_); sf(k_buf_); sf(v_buf_); sf(attn_out_); sf(norm_buf_);
+    sf(gate_logits_); sf(routing_weights_); sf(routing_indices_);
+    sf(expert_outputs_); sf(shared_out_);
     sf(expert_weight_buf_[0]); sf(expert_weight_buf_[1]);
-    sff(expert_gate_out_); sff(expert_up_out_);
-    sff(shared_gate_out_); sff(shared_up_out_);
-    sff(c_q_buf_); sff(c_kv_buf_); sff(kv_expanded_);
-    sff(k_nope_buf_); sff(v_mla_buf_); sff(k_full_buf_); sff(q_nope_buf_);
+    sf(expert_gate_out_); sf(expert_up_out_);
+    sf(shared_gate_out_); sf(shared_up_out_);
+    sf(c_q_buf_); sf(c_kv_buf_); sf(kv_expanded_);
+    sf(k_nope_buf_); sf(v_mla_buf_); sf(k_full_buf_); sf(q_nope_buf_);
     if (nvfp4_load_buf_) { cudaFreeHost(nvfp4_load_buf_); nvfp4_load_buf_ = nullptr; }
 }
 
