@@ -37,6 +37,7 @@ MoEExecutor::~MoEExecutor() {
             vf(ms.shared_gate_proj);
             vf(ms.shared_up_proj);
             vf(ms.shared_down_proj);
+            vf(ms.shared_nvfp4_buf);
             vf(ms.dense_ffn_buf);
         }
         moe_state_.clear();
@@ -465,30 +466,69 @@ bool MoEExecutor::initialize(const std::string& model_path,
             try_load(lp + ".mlp.gate.weight", ms.gate_weight, config_.num_experts * hd * sizeof(float));
         }
 
-        // Shared expert — only allocate FP32 buffers for non-NVFP4 models.
-        // NVFP4 shared experts (mlp.shared_experts.*) are U8 format and can't
-        // be directly used with the FP32 gemv path. Leave nullptr to skip the
-        // shared expert in forward_layer() (fused_moe_combine_norm handles nullptr).
-        if (config_.num_shared_experts > 0 && !has_nvfp4) {
-            ms.shared_gate_proj = memory_->vram_alloc(moe_inter * hd * sizeof(float));
-            ms.shared_up_proj   = memory_->vram_alloc(moe_inter * hd * sizeof(float));
-            ms.shared_down_proj = memory_->vram_alloc(hd * moe_inter * sizeof(float));
-            cudaMemset(ms.shared_gate_proj, 0, moe_inter * hd * sizeof(float));
-            cudaMemset(ms.shared_up_proj, 0, moe_inter * hd * sizeof(float));
-            cudaMemset(ms.shared_down_proj, 0, hd * moe_inter * sizeof(float));
+        // Shared expert
+        if (config_.num_shared_experts > 0) {
             // Try both singular and plural naming conventions
-            if (!loader.has_tensor(lp + ".mlp.shared_expert.gate_proj.weight"))
-                try_load(lp + ".mlp.shared_experts.gate_proj.weight", ms.shared_gate_proj, 0);
-            else
-                try_load(lp + ".mlp.shared_expert.gate_proj.weight", ms.shared_gate_proj, 0);
-            if (!loader.has_tensor(lp + ".mlp.shared_expert.up_proj.weight"))
-                try_load(lp + ".mlp.shared_experts.up_proj.weight", ms.shared_up_proj, 0);
-            else
-                try_load(lp + ".mlp.shared_expert.up_proj.weight", ms.shared_up_proj, 0);
-            if (!loader.has_tensor(lp + ".mlp.shared_expert.down_proj.weight"))
-                try_load(lp + ".mlp.shared_experts.down_proj.weight", ms.shared_down_proj, 0);
-            else
-                try_load(lp + ".mlp.shared_expert.down_proj.weight", ms.shared_down_proj, 0);
+            std::string se_prefix;
+            if (loader.has_tensor(lp + ".mlp.shared_experts.gate_proj.weight"))
+                se_prefix = lp + ".mlp.shared_experts.";
+            else if (loader.has_tensor(lp + ".mlp.shared_expert.gate_proj.weight"))
+                se_prefix = lp + ".mlp.shared_expert.";
+
+            if (!se_prefix.empty() && has_nvfp4) {
+                // NVFP4 shared expert: same size as a regular MoE expert (moe_inter, not dense_inter)
+                ms.shared_nvfp4_buf = memory_->vram_alloc(expert_bytes_);
+                if (ms.shared_nvfp4_buf) {
+                    cudaMemset(ms.shared_nvfp4_buf, 0, expert_bytes_);
+                    uint8_t* cpu = (uint8_t*)nvfp4_load_buf_;
+                    size_t off = 0;
+                    auto rdns = [&](const std::string& name, size_t sz) -> bool {
+                        if (!loader.has_tensor(name)) { memset(cpu+off, 0, sz); return true; }
+                        return loader.read_tensor_cpu(name, cpu+off, sz) == (ssize_t)sz;
+                    };
+                    auto rdg = [&](const std::string& name) -> bool {
+                        if (!loader.has_tensor(name)) { float one=1.f; memcpy(cpu+off,&one,4); return true; }
+                        auto meta = loader.get_meta(name);
+                        if (meta.byte_size() == 2) {
+                            uint16_t bf16=0; loader.read_tensor_cpu(name,&bf16,2);
+                            uint32_t f32bits=(uint32_t)bf16<<16; memcpy(cpu+off,&f32bits,4); return true;
+                        }
+                        return loader.read_tensor_cpu(name,cpu+off,4)==4;
+                    };
+                    // Shared expert uses moe_intermediate_dim (same as regular experts)
+                    bool ok = rdns(se_prefix+"gate_proj.weight", nvfp4_gate_w_bytes_); off+=nvfp4_gate_w_bytes_;
+                    ok = ok && rdns(se_prefix+"gate_proj.weight_scale", nvfp4_gate_s_bytes_); off+=nvfp4_gate_s_bytes_;
+                    ok = ok && rdg(se_prefix+"gate_proj.weight_scale_2"); off+=sizeof(float);
+                    memcpy(&ms.shared_gate_g, cpu + off - sizeof(float), sizeof(float));
+                    ok = ok && rdns(se_prefix+"up_proj.weight", nvfp4_up_w_bytes_); off+=nvfp4_up_w_bytes_;
+                    ok = ok && rdns(se_prefix+"up_proj.weight_scale", nvfp4_up_s_bytes_); off+=nvfp4_up_s_bytes_;
+                    ok = ok && rdg(se_prefix+"up_proj.weight_scale_2"); off+=sizeof(float);
+                    memcpy(&ms.shared_up_g, cpu + off - sizeof(float), sizeof(float));
+                    ok = ok && rdns(se_prefix+"down_proj.weight", nvfp4_down_w_bytes_); off+=nvfp4_down_w_bytes_;
+                    ok = ok && rdns(se_prefix+"down_proj.weight_scale", nvfp4_down_s_bytes_); off+=nvfp4_down_s_bytes_;
+                    ok = ok && rdg(se_prefix+"down_proj.weight_scale_2"); off+=sizeof(float);
+                    memcpy(&ms.shared_down_g, cpu + off - sizeof(float), sizeof(float));
+                    if (ok) {
+                        cudaMemcpy(ms.shared_nvfp4_buf, nvfp4_load_buf_, expert_bytes_, cudaMemcpyHostToDevice);
+                        ms.has_nvfp4_shared = true;
+                        if (l == 1)
+                            LOG_INFO("Shared expert layer %u: loaded %.1f MB (g=%.5f, u=%.5f, d=%.5f)",
+                                     l, expert_bytes_/1e6,
+                                     ms.shared_gate_g, ms.shared_up_g, ms.shared_down_g);
+                    }
+                }
+            } else if (!se_prefix.empty() && !has_nvfp4) {
+                // FP32 shared expert
+                ms.shared_gate_proj = memory_->vram_alloc(moe_inter * hd * sizeof(float));
+                ms.shared_up_proj   = memory_->vram_alloc(moe_inter * hd * sizeof(float));
+                ms.shared_down_proj = memory_->vram_alloc(hd * moe_inter * sizeof(float));
+                cudaMemset(ms.shared_gate_proj, 0, moe_inter * hd * sizeof(float));
+                cudaMemset(ms.shared_up_proj, 0, moe_inter * hd * sizeof(float));
+                cudaMemset(ms.shared_down_proj, 0, hd * moe_inter * sizeof(float));
+                try_load(se_prefix + "gate_proj.weight", ms.shared_gate_proj, 0);
+                try_load(se_prefix + "up_proj.weight", ms.shared_up_proj, 0);
+                try_load(se_prefix + "down_proj.weight", ms.shared_down_proj, 0);
+            }
         }
 
         if ((l + 1) % 10 == 0 || l == config_.num_layers - 1)
@@ -916,7 +956,24 @@ void MoEExecutor::forward_layer(float* hidden, float* residual,
     }
 
     // Shared expert
-    if (config_.num_shared_experts > 0 && ms.shared_gate_proj) {
+    if (config_.num_shared_experts > 0 && ms.has_nvfp4_shared && ms.shared_nvfp4_buf) {
+        // NVFP4 shared expert path — uses moe_intermediate_dim (same as routed experts)
+        const uint8_t* d_gate_w = (const uint8_t*)ms.shared_nvfp4_buf;
+        const uint8_t* d_gate_s = d_gate_w + nvfp4_gate_w_bytes_;
+        const uint8_t* d_up_w   = d_gate_s + nvfp4_gate_s_bytes_ + sizeof(float);
+        const uint8_t* d_up_s   = d_up_w   + nvfp4_up_w_bytes_;
+        const uint8_t* d_down_w = d_up_s   + nvfp4_up_s_bytes_   + sizeof(float);
+        const uint8_t* d_down_s = d_down_w + nvfp4_down_w_bytes_;
+
+        cuda::dequant_matvec_nvfp4(d_gate_w, d_gate_s, ms.shared_gate_g,
+                                    norm_buf_, shared_gate_out_, moe_inter, hd, stream);
+        cuda::dequant_matvec_nvfp4(d_up_w,   d_up_s,   ms.shared_up_g,
+                                    norm_buf_, shared_up_out_,   moe_inter, hd, stream);
+        cuda::swiglu(shared_gate_out_, shared_gate_out_, shared_up_out_, moe_inter, stream);
+        cuda::dequant_matvec_nvfp4(d_down_w, d_down_s, ms.shared_down_g,
+                                    shared_gate_out_, shared_out_, hd, moe_inter, stream);
+    } else if (config_.num_shared_experts > 0 && ms.shared_gate_proj) {
+        // FP32 shared expert path
         cuda::gemv_fp32((const float*)ms.shared_gate_proj, norm_buf_,
                         shared_gate_out_, moe_inter, hd, stream);
         cuda::gemv_fp32((const float*)ms.shared_up_proj, norm_buf_,
@@ -931,10 +988,11 @@ void MoEExecutor::forward_layer(float* hidden, float* residual,
     float* next_norm = (layer_id + 1 < config_.num_layers)
                        ? attn_weights_[layer_id + 1].attn_norm
                        : final_norm_;
-    float shared_w = (config_.num_shared_experts > 0) ? 1.0f : 0.0f;
+    bool has_shared = (ms.has_nvfp4_shared && ms.shared_nvfp4_buf) || ms.shared_gate_proj;
+    float shared_w = has_shared ? 1.0f : 0.0f;
     cuda::fused_moe_combine_norm(
         hidden, residual, expert_outputs_, routing_weights_,
-        (config_.num_shared_experts > 0) ? shared_out_ : nullptr, shared_w,
+        has_shared ? shared_out_ : nullptr, shared_w,
         next_norm, hd, k, 1e-5f, stream
     );
 }

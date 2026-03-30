@@ -77,9 +77,15 @@ private:
     // MoE per-layer state
     struct MoELayerState {
         float* gate_weight = nullptr;   // [num_experts, hidden_dim]
-        void* shared_gate_proj = nullptr;
+        void* shared_gate_proj = nullptr;  // FP32 or nullptr
         void* shared_up_proj = nullptr;
         void* shared_down_proj = nullptr;
+        // NVFP4 shared expert buffer (same layout as dense_ffn_buf)
+        void*  shared_nvfp4_buf = nullptr;
+        float  shared_gate_g   = 1.0f;
+        float  shared_up_g     = 1.0f;
+        float  shared_down_g   = 1.0f;
+        bool   has_nvfp4_shared = false;
         // Dense FFN (for first_k_dense_replace layers): pre-loaded NVFP4 GPU buffer
         void*  dense_ffn_buf = nullptr; // GPU: [gate_w|gate_s|gate_g|up_w|up_s|up_g|down_w|down_s|down_g]
         float  dense_gate_g  = 1.0f;
