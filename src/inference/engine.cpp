@@ -227,7 +227,7 @@ void InferenceEngine::generate(const std::string& prompt,
             float h_sum = 0;
             std::vector<float> h_check(cfg.hidden_dim);
             cudaMemcpy(h_check.data(), hidden, cfg.hidden_dim * sizeof(float), cudaMemcpyDeviceToHost);
-            for (auto v : h_check) h_sum += fabsf(v);
+            for (auto v : h_check) h_sum += (v > 0 ? v : -v);
             LOG_INFO("hidden L1 norm = %.6f (dim=%u)", h_sum, cfg.hidden_dim);
         }
 
