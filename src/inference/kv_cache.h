@@ -17,10 +17,16 @@ public:
     KVCache() = default;
     ~KVCache();
 
-    // Initialize cache for given model dimensions
+    // Initialize cache for given model dimensions — allocates via cudaMalloc
     bool initialize(uint32_t num_layers, uint32_t num_kv_heads,
                     uint32_t head_dim, uint32_t max_seq_len,
                     DType dtype = DType::FP32);
+
+    // Initialize using externally-allocated GPU buffers (e.g. from a VRAM pool).
+    // The caller owns the buffers; KVCache will NOT free them on destruction.
+    bool initialize_external(uint32_t num_layers, uint32_t num_kv_heads,
+                             uint32_t head_dim, uint32_t max_seq_len,
+                             float* k_buf, float* v_buf);
 
     // Get pointer to K cache for a specific layer
     // Returns pointer to [max_seq_len, num_kv_heads, head_dim]
@@ -53,6 +59,7 @@ public:
 private:
     float*      k_data_ = nullptr;  // [num_layers * max_seq_len * num_kv_heads * head_dim]
     float*      v_data_ = nullptr;
+    bool        owns_memory_ = true;  // false when initialized via initialize_external()
     uint32_t    num_layers_ = 0;
     uint32_t    num_kv_heads_ = 0;
     uint32_t    head_dim_ = 0;

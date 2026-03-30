@@ -125,7 +125,7 @@ bool Tokenizer::parse_tokenizer_json(const std::string& path) {
     // Format: {"model": {"vocab": {"token": id, ...}, "merges": ["a b", ...]}}
     auto vocab_pos = json.find("\"vocab\"");
     if (vocab_pos == std::string::npos) {
-        LOG_ERROR("No vocab section in tokenizer.json");
+        LOG_WARN("No vocab section in tokenizer.json — will try tiktoken format");
         return false;
     }
 

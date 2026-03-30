@@ -7,8 +7,10 @@
 namespace titan {
 
 KVCache::~KVCache() {
-    if (k_data_) cudaFree(k_data_);
-    if (v_data_) cudaFree(v_data_);
+    if (owns_memory_) {
+        if (k_data_) cudaFree(k_data_);
+        if (v_data_) cudaFree(v_data_);
+    }
 }
 
 bool KVCache::initialize(uint32_t num_layers, uint32_t num_kv_heads,
@@ -51,6 +53,30 @@ bool KVCache::initialize(uint32_t num_layers, uint32_t num_kv_heads,
              num_layers, num_kv_heads, head_dim, max_seq_len,
              total_bytes * 2 / 1e6);
 
+    return true;
+}
+
+bool KVCache::initialize_external(uint32_t num_layers, uint32_t num_kv_heads,
+                                   uint32_t head_dim, uint32_t max_seq_len,
+                                   float* k_buf, float* v_buf) {
+    if (!k_buf || !v_buf) return false;
+    num_layers_   = num_layers;
+    num_kv_heads_ = num_kv_heads;
+    head_dim_     = head_dim;
+    max_seq_len_  = max_seq_len;
+    seq_len_      = 0;
+    layer_stride_ = (size_t)max_seq_len * num_kv_heads * head_dim;
+    k_data_       = k_buf;
+    v_data_       = v_buf;
+    owns_memory_  = false;  // caller (VRAM pool) owns these pointers
+
+    size_t total_bytes = (size_t)num_layers * layer_stride_ * sizeof(float);
+    cudaMemset(k_data_, 0, total_bytes);
+    cudaMemset(v_data_, 0, total_bytes);
+
+    LOG_INFO("KV cache: %u layers, %u heads, dim=%u, max_seq=%u (%.1f MB, pool-backed)",
+             num_layers, num_kv_heads, head_dim, max_seq_len,
+             total_bytes * 2 / 1e6);
     return true;
 }
 

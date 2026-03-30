@@ -182,6 +182,11 @@ public:
     RamPool& ram() { return *ram_; }
     NvmePool& nvme() { return *nvme_; }
 
+    // Convenience wrappers for VRAM pool sub-allocation
+    size_t vram_free_bytes() const { return vram_ ? vram_->available() : 0; }
+    void*  vram_alloc(size_t bytes) { return vram_ ? vram_->allocate(bytes) : nullptr; }
+    void   vram_free(void* ptr)     { if (vram_) vram_->free(ptr); }
+
     // High-level: load tensor to target tier
     // Handles the chain: NVMe → RAM → VRAM with proper staging
     void load_tensor(Tensor& tensor, MemoryTier target);
