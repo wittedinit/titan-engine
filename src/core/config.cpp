@@ -188,12 +188,17 @@ ModelConfig load_model_config(const std::string& config_path) {
     // Top-level pass — picks up top-level model_type and vocab_size
     parse_model_fields(json, cfg);
 
-    // If there's a nested text_config (Kimi K2.5, multimodal wrappers, etc.),
-    // parse it and let it override — text_config holds the LLM parameters
-    std::string text_cfg = json_nested_object(json, "text_config");
-    if (!text_cfg.empty()) {
-        LOG_INFO("Found nested text_config — parsing LLM parameters from it");
-        parse_model_fields(text_cfg, cfg);
+    // If there's a nested LLM config object, parse it and let it override.
+    // Different model families use different wrapper key names:
+    //   text_config          — Llama 3, Phi-3, generic multimodal wrappers
+    //   language_model_config — Kimi K2.5 (kimi_k25 wrapper around deepseek_v3)
+    for (const auto& nested_key : {"text_config", "language_model_config"}) {
+        std::string nested = json_nested_object(json, nested_key);
+        if (!nested.empty()) {
+            LOG_INFO("Found nested %s — parsing LLM parameters from it", nested_key);
+            parse_model_fields(nested, cfg);
+            break;  // first match wins
+        }
     }
 
     // Derived values

@@ -145,19 +145,26 @@ bool MoEExecutor::initialize(const std::string& model_path,
                                   ? config_.nope_head_dim
                                   : config_.head_dim;
 
-    // Auto-cap context length: KV cache = 2 × layers × kv_heads × head_dim × ctx × 4 bytes
-    // Must fit within available VRAM (leave 8GB headroom for weights and scratch)
+    // Auto-cap context length based on FREE VRAM at the time of init.
+    // KV cache = 2 × layers × kv_heads × head_dim × ctx × sizeof(float).
+    // Reserve 24 GB for model weights + scratch (Kimi K2.5 NVFP4 weights ~23 GB).
+    // This is called before weights are loaded, so free VRAM ≈ total VRAM here.
     {
-        size_t vram_bytes = 0;
-        cudaMemGetInfo(nullptr, &vram_bytes);  // total VRAM
-        size_t kv_headroom = (vram_bytes > (size_t)8 << 30) ? vram_bytes - ((size_t)8 << 30) : (size_t)2 << 30;
-        size_t kv_per_ctx = 2ULL * config_.num_layers * config_.num_kv_heads * kv_cache_head_dim * 4;
-        uint32_t max_ctx_by_vram = kv_per_ctx > 0 ? (uint32_t)(kv_headroom / kv_per_ctx) : runtime.max_context_len;
-        // Round down to power of 2 and clamp
+        size_t free_vram = 0, total_vram = 0;
+        cudaMemGetInfo(&free_vram, &total_vram);
+        LOG_INFO("VRAM at KV cache init: %.1f GB free / %.1f GB total",
+                 free_vram / 1e9, total_vram / 1e9);
+
+        // Reserve space for weights (heuristic: leave 24 GB or half of total, whichever smaller)
+        size_t weight_reserve = std::min((size_t)24 << 30, total_vram / 2);
+        size_t kv_budget = (free_vram > weight_reserve) ? free_vram - weight_reserve : (size_t)512 << 20;
+
+        size_t kv_per_ctx = 2ULL * config_.num_layers * config_.num_kv_heads * kv_cache_head_dim * sizeof(float);
+        uint32_t max_ctx_by_vram = kv_per_ctx > 0 ? (uint32_t)(kv_budget / kv_per_ctx) : runtime.max_context_len;
         uint32_t capped_ctx = std::min(runtime.max_context_len, std::max(512u, max_ctx_by_vram));
         if (capped_ctx < runtime.max_context_len) {
-            LOG_WARN("KV cache: capping context from %u to %u to fit in VRAM",
-                     runtime.max_context_len, capped_ctx);
+            LOG_WARN("KV cache: capping context from %u to %u (%.1f MB KV budget)",
+                     runtime.max_context_len, capped_ctx, kv_budget / 1e6);
         }
         if (!kv_cache_.initialize(config_.num_layers, config_.num_kv_heads,
                                    kv_cache_head_dim, capped_ctx))
